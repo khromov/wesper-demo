@@ -18,7 +18,7 @@ RUN_DIR gets:
                       recording's own mel through the vocoder, the best possible result), and
                       step_NNNNNN/ (the decoder's output from the units, as WESPER produces it)
 
-usage: python decoder/train.py DATA_DIR RUN_DIR [--steps 100000] [--batch-size 16] [--init googletts]
+usage: python decoder/train.py DATA_DIR RUN_DIR [--steps 30000] [--batch-size 16] [--init googletts]
 """
 import argparse
 import csv
@@ -140,7 +140,9 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("data_dir", help="output of decoder/prepare_data.py")
     parser.add_argument("run_dir", help="where checkpoints and samples go; re-run to resume")
-    parser.add_argument("--steps", type=int, default=100000)
+    # 15 h of audio is ~350 steps per pass at batch 16, so 30,000 is ~85 passes: plenty for
+    # fine-tuning. Re-running with a higher --steps continues where it stopped.
+    parser.add_argument("--steps", type=int, default=30000)
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--init", default="googletts", help="googletts, lj, none, or a checkpoint path")
     parser.add_argument("--eval-every", type=int, default=2000)

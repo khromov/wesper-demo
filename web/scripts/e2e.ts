@@ -1,16 +1,18 @@
 // End-to-end test: runs the app in Google Chrome with a fake microphone that plays
 // sample_whisper.wav, and checks every path a person would use.
-//   - The Swedish encoder, fp16 and WebGPU are the defaults.
+//   - The Swedish encoder and WebGPU are the defaults.
 //   - Push-to-talk works with the mouse and with Space, and converts with both encoders.
-//   - An uploaded file converts too, and "Run again" works after switching to fp32 and to WASM.
-//   - WebGPU and WASM agree at fp32, and the two encoders give different results.
+//   - An uploaded file converts too, and "Run again" works after switching to WASM.
+//   - WebGPU and WASM agree, and the two encoders give different results.
+//   - Old downloads are cleaned up, and a private window says it can't keep the models.
 //
 //   bun run test:e2e            # against the dev server (needs the models: see README.md)
 //   bun run test:e2e --preview  # against a production build (vite build + vite preview)
 //   bun run test:e2e --headed   # watch it happen
 // Each step has a timeout, and the whole run is killed after 15 minutes.
 import { spawn } from "node:child_process";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { chromium, type Page } from "playwright-core";
 import { decodeWav } from "../src/lib/audio/wav";
@@ -61,7 +63,6 @@ async function waitForServer() {
 
 interface OutputInfo {
   encoder: string;
-  precision: string;
   backend: string;
   status: string;
   error: string;
@@ -93,7 +94,7 @@ const takes = (page: Page): Promise<TakeInfo[]> =>
           finite &&= Number.isFinite(v);
         }
         return {
-          encoder: o.encoder.id, precision: o.precision, backend: o.backend, status: o.status, error: o.error,
+          encoder: o.encoder.id, backend: o.backend, status: o.status, error: o.error,
           samples: s?.length ?? 0, rmsDb: s ? 10 * Math.log10(sum / s.length + 1e-12) : -120, finite, ms: o.encodeMs + o.decodeMs,
         };
       }),
@@ -137,21 +138,24 @@ function check(cond: unknown, msg: string) {
   console.log(`  ok  ${msg}`);
 }
 
-function checkTake(t: TakeInfo, precision: string, backend: string, from = 0) {
+function checkTake(t: TakeInfo, backend: string, from = 0) {
   const outs = t.outputs.slice(from);
   check(outs.map((o) => o.encoder).join() === "sv,original", `take ${t.id}: converted with sv, then original (${outs.map((o) => o.encoder)})`);
   for (const o of outs) {
     check(o.status === "done", `take ${t.id} ${o.encoder}: done${o.error ? ` (${o.error})` : ""}`);
-    check(o.precision === precision && o.backend === backend, `take ${t.id} ${o.encoder}: ran ${o.precision} on ${o.backend}`);
+    check(o.backend === backend, `take ${t.id} ${o.encoder}: ran on ${o.backend}`);
     // 320 per 20 ms frame, plus 8 from HiFi-GAN's upsampling (its x5 layer adds one), as in Python
     check(o.samples === Math.floor(t.samples / 320) * 320 + 8, `take ${t.id} ${o.encoder}: ${o.samples} samples for ${t.samples} in`);
     check(o.finite && o.rmsDb > -40, `take ${t.id} ${o.encoder}: audible, finite output (${o.rmsDb.toFixed(1)} dBFS RMS)`);
-    console.log(`      ${o.encoder} ${o.precision} ${o.backend}: ${(o.ms / 1000).toFixed(2)} s for ${(t.samples / 16000).toFixed(1)} s of audio`);
+    console.log(`      ${o.encoder} ${o.backend}: ${(o.ms / 1000).toFixed(2)} s for ${(t.samples / 16000).toFixed(1)} s of audio`);
   }
 }
 
 let failed = false;
-const browser = await chromium.launch({
+// A real (temporary) profile, so storage behaves as for a person: the default context is
+// incognito-like, with an in-memory quota too small for the models.
+const profile = mkdtempSync(join(tmpdir(), "wesper-e2e-"));
+const browser = await chromium.launchPersistentContext(profile, {
   channel: "chrome",
   headless: !process.argv.includes("--headed"),
   args: [
@@ -164,9 +168,9 @@ const browser = await chromium.launch({
 });
 try {
   await waitForServer();
-  const page = await browser.newPage();
+  const page = browser.pages()[0] ?? (await browser.newPage());
   const consoleErrors: string[] = [];
-  page.on("console", (m) => m.type() === "error" && consoleErrors.push(m.text()));
+  page.on("console", (m) => (m.type() === "error" || m.text().includes("not caching")) && consoleErrors.push(m.text()));
   page.on("pageerror", (e) => consoleErrors.push(e.message));
   await page.goto(`http://localhost:${PORT}/`);
 
@@ -177,7 +181,7 @@ try {
     return { encoder: app.settings.encoder, compare: app.settings.compare, ...app.resolved, isolated: crossOriginIsolated, threads: app.caps.threads };
   });
   check(state.encoder === "sv" && state.compare, `Swedish encoder selected, compare on`);
-  check(state.backend === "webgpu" && state.precision === "fp16", `WebGPU fp16 by default (${state.backend} ${state.precision})`);
+  check(state.backend === "webgpu", `WebGPU by default (${state.backend})`);
   check(state.isolated && state.threads > 1, `cross-origin isolated, ${state.threads} WASM threads`);
 
   console.log("push-to-talk with the mouse");
@@ -194,7 +198,7 @@ try {
   let t = await waitForOutputs(page, 1, 2);
   check(t.samples > 1.5 * 16000 && t.samples < 4 * 16000, `take 1: ${(t.samples / 16000).toFixed(2)} s recorded`);
   check(t.levelDbfs > -60, `take 1: the fake microphone was heard (${t.levelDbfs.toFixed(1)} dBFS)`);
-  checkTake(t, "fp16", "webgpu");
+  checkTake(t, "webgpu");
 
   console.log("push-to-talk with Space");
   await page.keyboard.down("Space");
@@ -202,43 +206,59 @@ try {
   await page.keyboard.up("Space");
   t = await waitForOutputs(page, 2, 2);
   check(t.samples > 1.0 * 16000 && t.samples < 3 * 16000, `take 2: ${(t.samples / 16000).toFixed(2)} s recorded`);
-  checkTake(t, "fp16", "webgpu");
+  checkTake(t, "webgpu");
 
-  console.log("file upload, then fp32 and WASM");
+  console.log("file upload, then WASM");
   await page.getByTestId("file").setInputFiles(SAMPLE);
   t = await waitForOutputs(page, 3, 2);
   check(t.samples === SAMPLE_LENGTH, `take 3: the whole file (${t.samples} of ${SAMPLE_LENGTH} samples)`);
-  checkTake(t, "fp16", "webgpu");
-
-  await page.getByRole("radio", { name: /^fp32/ }).click();
-  await waitForReady(page);
-  await page.locator('[data-take="3"]').getByRole("button", { name: "Run again" }).click();
-  t = await waitForOutputs(page, 3, 4);
-  checkTake(t, "fp32", "webgpu", 2);
+  checkTake(t, "webgpu");
 
   await page.getByRole("radio", { name: /^WASM/ }).click();
   await waitForReady(page);
   await page.locator('[data-take="3"]').getByRole("button", { name: "Run again" }).click();
-  t = await waitForOutputs(page, 3, 6);
-  checkTake(t, "fp32", "wasm", 4);
+  t = await waitForOutputs(page, 3, 4);
+  checkTake(t, "wasm", 2);
 
-  const gpuVsWasm = await snr(page, 3, 2, 4);
-  check(gpuVsWasm > 50, `WebGPU and WASM agree at fp32 (Swedish: ${gpuVsWasm.toFixed(1)} dB SNR)`);
-  const encoders = await snr(page, 3, 2, 3);
+  const gpuVsWasm = await snr(page, 3, 0, 2);
+  check(gpuVsWasm > 50, `WebGPU and WASM agree (Swedish: ${gpuVsWasm.toFixed(1)} dB SNR)`);
+  const encoders = await snr(page, 3, 0, 1);
   check(encoders < 20, `the two encoders give different audio (${encoders.toFixed(1)} dB SNR)`);
 
-  console.log("persistence");
+  console.log("persistence and cache cleanup");
+  const cached = () => page.evaluate(async () => (await (await caches.open("wesper-models-v1")).keys()).map((r) => new URL(r.url).pathname));
+  const before = await cached();
+  check(before.length === 3, `the three models are cached (${before.join(", ")})`);
+  await page.evaluate(() => caches.open("wesper-models-v1").then((c) => c.put("/models/encoder-sv.fp16.onnx?v=old", new Response("old"))));
   await page.reload();
   await waitForReady(page);
   const after = await page.evaluate(() => (window as any).__wesper.settings);
-  check(after.precision === "fp32" && after.backend === "wasm", `settings survive a reload (${after.precision}, ${after.backend})`);
+  check(after.backend === "wasm", `settings survive a reload (${after.backend})`);
+  await page.waitForFunction(
+    async () => (await (await caches.open("wesper-models-v1")).keys()).every((r) => !r.url.includes("fp16")),
+    null, { timeout: 30_000, polling: 200 },
+  );
+  check((await cached()).sort().join() === before.sort().join(), "a download no longer in models.json is deleted, the models stay");
 
   check(consoleErrors.length === 0, `no console errors${consoleErrors.length ? `: ${consoleErrors.join(" | ")}` : ""}`);
+
+  console.log("private window");
+  const incognito = await chromium.launch({ channel: "chrome", headless: !process.argv.includes("--headed"), args: ["--enable-unsafe-webgpu"] });
+  try {
+    const p = await incognito.newPage();
+    await p.goto(`http://localhost:${PORT}/`);
+    await waitForReady(p);
+    const notice: string = await p.evaluate(() => (window as any).__wesper.notice);
+    check(/didn't let the page keep .*encoder/.test(notice), `says the models will download again: "${notice}"`);
+  } finally {
+    await incognito.close();
+  }
 } catch (e) {
   failed = true;
   console.error(`FAIL: ${e instanceof Error ? e.message : e}`);
 } finally {
   await browser.close();
+  rmSync(profile, { recursive: true, force: true });
   server.kill();
   clearTimeout(watchdog);
 }

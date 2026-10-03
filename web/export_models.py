@@ -1,9 +1,11 @@
 """Export WESPER's models to ONNX for the browser demo in web/.
 
 Writes into web/public/models/ (by default):
-  encoder-<id>.fp32.onnx / .fp16.onnx    audio [1, T] float32, 16 kHz -> soft units [1, T // 320, 256]
-  decoder-googletts.fp32.onnx / .fp16.onnx    soft units -> audio [1, S] float32 (FastSpeech2 + HiFi-GAN)
-  models.json    what the app loads: labels, files, sizes, hashes and each encoder's input level
+  encoder-<id>.onnx         audio [1, T] float32, 16 kHz -> soft units [1, T // 320, 256]
+  decoder-googletts.onnx    soft units -> audio [1, S] float32 (FastSpeech2 + HiFi-GAN)
+  models.json               what the app loads: labels, files, sizes, hashes and each encoder's input level
+
+The models stay fp32: fp16 versions were tried and sounded clearly worse in the browser.
 
 Encoders: WESPER's original, and the Swedish fine-tuned one if its checkpoint exists. Every
 exported file is checked against the PyTorch code path that convert.py and the GUI use; the
@@ -151,13 +153,6 @@ def export(module, example, path, input_name, output_name, axis_names):
                       dynamic_axes={input_name: {1: axis_names[0]}, output_name: {1: axis_names[1]}})
 
 
-def to_fp16(src, dst):
-    """fp16 weights and math; inputs and outputs stay float32, so the app feeds both the same way."""
-    import onnx
-    from onnxruntime.transformers.float16 import convert_float_to_float16
-    onnx.save(convert_float_to_float16(onnx.load(src), keep_io_types=True), dst)
-
-
 def session(path):
     import onnxruntime as ort
     opts = ort.SessionOptions()
@@ -175,44 +170,25 @@ def snr_db(ref, x):
     return float(10 * np.log10((ref ** 2).sum() / max(((ref - x) ** 2).sum(), 1e-30)))
 
 
-def log_mel_distance(ref, x):
-    """Mean absolute log-mel difference in dB over frames within 50 dB of the loudest. Judges fp16
-    on the spectrum: HiFi-GAN's waveform phase shifts with tiny input changes, so sample SNR can't."""
-    import librosa
-    def lm(y):
-        return librosa.power_to_db(librosa.feature.melspectrogram(
-            y=np.asarray(y, np.float32), sr=SR, n_fft=1024, hop_length=HOP, n_mels=80), ref=1.0, top_db=None)
-    A, B = lm(ref), lm(x)
-    n = min(A.shape[1], B.shape[1])
-    A, B = A[:, :n], B[:, :n]
-    keep = A.max(0) > A.max() - 50
-    return float(np.abs(A[:, keep] - B[:, keep]).mean())
+# The exported files must match PyTorch to float rounding.
+MIN_UNITS_COSINE, MIN_SNR_DB = 0.99999, 60.0
 
 
-# fp32 must match PyTorch to float rounding; fp16 to within what the spike measured as transparent
-# (units cosine 0.9998, 0.5-1 dB log-mel; normal vs whispered input of one sentence differ by ~8 dB).
-LIMITS = {"fp32": {"cos": 0.99999, "snr": 60.0}, "fp16": {"cos": 0.999, "mel": 2.0}}
-
-
-def check_encoder(path, precision, wav, ref_units):
+def check_encoder(path, wav, ref_units):
     units = session(path).run(None, {"wav": wav[None]})[0]
     assert units.shape == (1, len(wav) // HOP, 256), f"{path}: units shape {units.shape}"
     cos = cosine(units, ref_units)
-    assert cos >= LIMITS[precision]["cos"], f"{path}: units cosine {cos:.6f} vs PyTorch"
+    assert cos >= MIN_UNITS_COSINE, f"{path}: units cosine {cos:.6f} vs PyTorch"
     return {"unitsCosine": round(cos, 6)}
 
 
-def check_decoder(path, precision, units, ref):
+def check_decoder(path, units, ref):
     wav = session(path).run(None, {"units": units})[0][0]
     assert len(wav) == len(ref), f"{path}: {len(wav)} samples, PyTorch gives {len(ref)}"
     assert np.isfinite(wav).all(), f"{path}: non-finite samples"
-    if precision == "fp32":
-        snr = snr_db(ref, wav)
-        assert snr >= LIMITS["fp32"]["snr"], f"{path}: SNR {snr:.1f} dB vs PyTorch"
-        return {"snrDb": round(snr, 1)}
-    mel = log_mel_distance(ref, wav)
-    assert mel <= LIMITS["fp16"]["mel"], f"{path}: log-mel distance {mel:.2f} dB vs PyTorch"
-    return {"logMelDistanceDb": round(mel, 2)}
+    snr = snr_db(ref, wav)
+    assert snr >= MIN_SNR_DB, f"{path}: SNR {snr:.1f} dB vs PyTorch"
+    return {"snrDb": round(snr, 1)}
 
 
 def load_configs():
@@ -242,33 +218,23 @@ def test_clips():
 
 
 def export_encoder(hubert, eid, out, clips, log):
-    files, checks = {}, {}
-    wrapper = EncoderExport(hubert).eval()
     refs = [reference_units(hubert, w).numpy() for w in clips]
-    fp32 = os.path.join(out, f"encoder-{eid}.fp32.onnx")
-    export(wrapper, torch.tensor(clips[0])[None], fp32, "wav", "units", ("samples", "frames"))
-    fp16 = os.path.join(out, f"encoder-{eid}.fp16.onnx")
-    to_fp16(fp32, fp16)
-    for precision, path in (("fp32", fp32), ("fp16", fp16)):
-        checks[precision] = [check_encoder(path, precision, w, r) for w, r in zip(clips, refs)]
-        files[precision] = file_info(path)
-        log(f"  {os.path.basename(path)}: {files[precision]['bytes'] / 1e6:.0f} MB, {checks[precision]}")
-    return files, checks
+    path = os.path.join(out, f"encoder-{eid}.onnx")
+    export(EncoderExport(hubert).eval(), torch.tensor(clips[0])[None], path, "wav", "units", ("samples", "frames"))
+    checks = [check_encoder(path, w, r) for w, r in zip(clips, refs)]
+    info = file_info(path)
+    log(f"  {info['path']}: {info['bytes'] / 1e6:.0f} MB, {checks}")
+    return info, checks
 
 
 def export_decoder(fs2, vocoder, did, out, units_list, log):
-    files, checks = {}, {}
-    wrapper = DecoderExport(fs2, vocoder).eval()
     refs = [reference_wav(fs2, vocoder, torch.tensor(u)).numpy() for u in units_list]
-    fp32 = os.path.join(out, f"decoder-{did}.fp32.onnx")
-    export(wrapper, torch.tensor(units_list[0]), fp32, "units", "wav", ("frames", "samples"))
-    fp16 = os.path.join(out, f"decoder-{did}.fp16.onnx")
-    to_fp16(fp32, fp16)
-    for precision, path in (("fp32", fp32), ("fp16", fp16)):
-        checks[precision] = [check_decoder(path, precision, u, r) for u, r in zip(units_list, refs)]
-        files[precision] = file_info(path)
-        log(f"  {os.path.basename(path)}: {files[precision]['bytes'] / 1e6:.0f} MB, {checks[precision]}")
-    return files, checks
+    path = os.path.join(out, f"decoder-{did}.onnx")
+    export(DecoderExport(fs2, vocoder).eval(), torch.tensor(units_list[0]), path, "units", "wav", ("frames", "samples"))
+    checks = [check_decoder(path, u, r) for u, r in zip(units_list, refs)]
+    info = file_info(path)
+    log(f"  {info['path']}: {info['bytes'] / 1e6:.0f} MB, {checks}")
+    return info, checks
 
 
 ENCODERS = {  # id -> label, description; the first one found is the app's default
@@ -298,7 +264,7 @@ def main(argv=None):
     log = lambda s: print(s, flush=True)
     try:
         clips = test_clips()
-        manifest = {"version": 1, "sampleRate": SR, "hop": HOP, "maxSeconds": MAX_SECONDS,
+        manifest = {"version": 2, "sampleRate": SR, "hop": HOP, "maxSeconds": MAX_SECONDS,
                     "encoders": [], "decoders": []}
         units_for_decoder = None
         for eid in ("sv", "original"):
@@ -308,7 +274,7 @@ def main(argv=None):
                 continue
             log(f"### encoder {eid}: {src}")
             hubert = wn.load_hubert(src, device="cpu")
-            files, checks = export_encoder(hubert, eid, out, clips, log)
+            info, checks = export_encoder(hubert, eid, out, clips, log)
             # like MyWhisper2Normal: normalize the input only if the encoder was trained that way
             target = hubert.training_config.get("TARGET_DBFS")
             max_gain = hubert.training_config.get("MAX_GAIN_DB", 40.0) if target is not None else None
@@ -316,7 +282,7 @@ def main(argv=None):
                 "id": eid, "label": ENCODERS[eid][0], "description": ENCODERS[eid][1],
                 "targetDbfs": target, "maxGainDb": max_gain,
                 "source": os.path.relpath(src, REPO) if not src.startswith("http") else src,
-                "files": files, "checks": checks})
+                "file": info, "checks": checks})
             if units_for_decoder is None:
                 units_for_decoder = [reference_units(hubert, w).numpy() for w in clips]
             del hubert
@@ -327,10 +293,10 @@ def main(argv=None):
         configs = load_configs()
         fs2 = wn.load_fastspeech2(configs, checkpoint_path=args.fastspeech2, device="cpu")
         vocoder = wn.load_hifigan(configs[1], checkpoint_path=args.hifigan, device="cpu")
-        files, checks = export_decoder(fs2, vocoder, "googletts", out, units_for_decoder, log)
+        info, checks = export_decoder(fs2, vocoder, "googletts", out, units_for_decoder, log)
         manifest["decoders"].append({
             "id": "googletts", "label": "googletts_neutral", "description": "WESPER's English voice trained on Google TTS output, with HiFi-GAN 16 kHz",
-            "source": [args.fastspeech2, args.hifigan], "files": files, "checks": checks})
+            "source": [args.fastspeech2, args.hifigan], "file": info, "checks": checks})
 
         with open(os.path.join(out, "models.json"), "w") as f:
             json.dump(manifest, f, indent=2)

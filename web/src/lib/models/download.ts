@@ -1,4 +1,4 @@
-// Model downloads with progress, kept in the Cache API so the ~300-600 MB arrive only once.
+// Model downloads with progress, kept in the Cache API so the ~1 GB arrives only once.
 // The cache is an optimization: without it (private windows, quota, no Cache API) each visit
 // downloads again.
 
@@ -14,15 +14,21 @@ async function openCache(): Promise<Cache | undefined> {
   }
 }
 
+export interface Downloaded {
+  data: Uint8Array;
+  /** The file is in the cache: it came from there, or was stored. */
+  cached: boolean;
+}
+
 /** The file at url, which models.json says is `bytes` long. */
-export async function download(url: string, bytes: number, onProgress: DownloadProgress): Promise<Uint8Array> {
+export async function download(url: string, bytes: number, onProgress: DownloadProgress): Promise<Downloaded> {
   const cache = await openCache();
   const hit = await cache?.match(url).catch(() => undefined);
   if (hit) {
     const buf = new Uint8Array(await hit.arrayBuffer());
     if (buf.length === bytes) {
       onProgress(bytes, bytes, true);
-      return buf;
+      return { data: buf, cached: true };
     }
   }
 
@@ -41,17 +47,26 @@ export async function download(url: string, bytes: number, onProgress: DownloadP
   }
   if (off !== bytes) throw new Error(`${url}: received ${off} of ${bytes} bytes`);
 
-  if (cache) {
-    try {
-      await cache.put(url, new Response(buf));
-      // Drop earlier exports of the same file: they differ only in the ?v= hash.
-      const path = new URL(url).pathname;
-      for (const req of await cache.keys()) if (req.url !== url && new URL(req.url).pathname === path) await cache.delete(req);
-    } catch (e) {
-      console.warn(`not caching ${url}:`, e);
-    }
+  if (!cache) return { data: buf, cached: false };
+  try {
+    await cache.put(url, new Response(buf));
+    // Drop earlier exports of the same file: they differ only in the ?v= hash.
+    const path = new URL(url).pathname;
+    for (const req of await cache.keys()) if (req.url !== url && new URL(req.url).pathname === path) await cache.delete(req);
+    return { data: buf, cached: true };
+  } catch (e) {
+    // e.g. over quota: private windows allow far less storage than the models need
+    console.warn(`not caching ${url}:`, e);
+    return { data: buf, cached: false };
   }
-  return buf;
+}
+
+/** Deletes downloads whose URL isn't in `keep`. */
+export async function pruneDownloads(keep: string[]): Promise<void> {
+  const cache = await openCache();
+  if (!cache) return;
+  const wanted = new Set(keep);
+  for (const req of await cache.keys()) if (!wanted.has(req.url)) await cache.delete(req);
 }
 
 /** Bytes this site stores, which is almost all downloaded models; null if the browser won't say. */

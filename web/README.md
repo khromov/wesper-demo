@@ -7,10 +7,8 @@ on WebGPU when the browser has it and WebAssembly otherwise. No audio leaves the
 
 - **Encoders:** Swedish (fine-tuned, the default) and the original, side by side. With *Also
   convert with…* on, each take is converted by both, so you can A/B them with keys `1` and `2`.
-- **Precision:** fp16 (default) or fp32. Downloads are 480 MB and 960 MB with both encoders, 290 MB
-  and 580 MB with one.
 - **Backend:** Auto (WebGPU if available), WebGPU, or WASM.
-- **Run again** converts an earlier take with the current settings, e.g. to compare fp16 with fp32.
+- **Run again** converts an earlier take with the current settings, e.g. on the other backend.
 - Each result shows its timing and the gain applied to the input. Results can be downloaded as WAV.
 
 ## Running it
@@ -30,8 +28,11 @@ The export takes the Swedish encoder from `colab/data/runs/n2w-finetune/encoder_
 skips it if that file is missing (`--sv PATH` to use another). The original encoder and the
 googletts decoder are WESPER's release files (downloaded on first use; cached by torch).
 
-Models are cached in the browser (Cache API) after the first download. The footer shows how much
-is stored, with a link to clear it.
+The models are fp32: 378 MB per encoder and 200 MB for the decoder, so 956 MB with both encoders.
+They're cached in the browser (Cache API) after the first download; the footer shows how much is
+stored, with a link to clear it. Private windows don't allow that much storage, so there they
+download on every visit, and the app says so. Files from earlier exports are deleted from the
+cache on load.
 
 ## Tests
 
@@ -44,8 +45,8 @@ WESPER_EXPORT_SMOKE=1 .venv/bin/python -m unittest tests.test_export_models -v  
 ```
 
 The end-to-end test plays `sample_whisper.wav` as the microphone. It checks push-to-talk with the
-mouse and with Space, file upload, both encoders, fp16 and fp32, WebGPU and WASM (which must agree
-at fp32), and that settings survive a reload.
+mouse and with Space, file upload, both encoders, WebGPU and WASM (which must agree), that settings
+survive a reload, the cache cleanup, and the private-window message.
 
 ## How it works
 
@@ -54,7 +55,7 @@ at fp32), and that settings survive a reload.
 | ONNX export, checked against PyTorch | `export_models.py` |
 | Models list (`models.json`), file URLs | `src/lib/models/` |
 | Inference in a Web Worker; downloads with progress and caching; warm-up | `src/lib/engine/worker.ts`, `src/lib/models/download.ts` |
-| WebGPU/WASM and fp16/fp32 choice | `src/lib/engine/backend.ts` |
+| WebGPU or WASM | `src/lib/engine/backend.ts` |
 | Microphone (AudioWorklet), resampling to 16 kHz, playback | `src/lib/audio/` |
 | Input level normalization, a port of `speech_dbfs()` | `src/lib/audio/level.ts` |
 | State and actions | `src/lib/app.svelte.ts` |
@@ -73,23 +74,24 @@ normalized to the level it was trained on; the original gets it unchanged, as in
   send them. On another host, add both headers (GitHub Pages can't; Netlify, Cloudflare Pages or a
   Hugging Face Space can). Without them WASM runs single-threaded, and the app says so.
 - **ONNX Runtime's JSEP build** (`ort.min.mjs` plus `public/ort/*.jsep.*`, copied on
-  `bun install`). Its newer native WebGPU build gave NaN audio from the fp32 decoder in Chrome
-  154.
+  `bun install`). Its newer native WebGPU build gave NaN audio from the decoder in Chrome 154.
 - **Models elsewhere:** set `VITE_MODELS_URL` (e.g. a Hugging Face repo's `resolve/main/` URL) to
   load them from another server; it must send CORS headers. `bun run build` otherwise copies
-  `public/models/` into `dist/` (1.4 GB).
+  `public/models/` into `dist/` (956 MB).
 
 ### Measured (Chrome 154, Apple M3, 5.8 s whisper)
 
-| Backend | Download | Conversion | vs. PyTorch |
-|---|---|---|---|
-| WebGPU, fp16 | 289 MB | ~0.6–0.8 s | 0.2–1 dB log-mel difference |
-| WebGPU, fp32 | 578 MB | ~1.2–1.7 s | same output (86–109 dB SNR) |
-| WASM, fp32, 8 threads | 578 MB | ~4 s | same output |
+| Backend | Conversion | vs. PyTorch |
+|---|---|---|
+| WebGPU | ~1.2–1.7 s | same output (86–109 dB SNR) |
+| WASM, 8 threads | ~4 s | same output |
 
 The first conversion after loading compiles GPU shaders (a few seconds); the app does that with a
-second of silence while loading. int8 models were tried and dropped: no faster in WASM, and 2–3 dB
-further from PyTorch.
+second of silence while loading.
+
+Smaller models were tried and dropped. **fp16** halved the download and the time, and looked close
+on paper (units cosine 0.9998, under 1 dB log-mel difference measured on the CPU), but sounded
+clearly worse in the browser. **int8** was no faster in WASM, and further from PyTorch still.
 
 ### Export notes
 

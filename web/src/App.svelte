@@ -5,7 +5,6 @@
   import TakeCard from "./components/TakeCard.svelte";
   import { App } from "./lib/app.svelte";
   import type { BackendChoice } from "./lib/engine/backend";
-  import type { Precision } from "./lib/models/manifest";
 
   const app = new App();
   // For poking at the state from devtools, and for scripts/e2e.ts.
@@ -67,7 +66,7 @@
     {#if app.resolved && app.caps}
       <p class="engine small" data-testid="engine">
         <span class="dot" class:ready={app.ready}></span>
-        {backendName[app.resolved.backend]} · {app.resolved.precision}
+        {backendName[app.resolved.backend]}
         {#if app.resolved.backend === "webgpu" && app.caps.adapter}<span class="muted">· {app.caps.adapter}</span>{/if}
         {#if app.resolved.backend === "wasm"}<span class="muted">· {app.caps.threads} threads</span>{/if}
       </p>
@@ -84,12 +83,6 @@
           value={app.settings.encoder}
           options={app.manifest.encoders.map((e) => ({ value: e.id, label: e.label }))}
           onchange={(encoder) => app.update({ encoder })}
-        />
-        <Segmented
-          label="Precision"
-          value={app.settings.precision}
-          options={(["fp16", "fp32"] as Precision[]).map((p) => ({ value: p, label: p, hint: mb(app.downloadBytes(p)) }))}
-          onchange={(precision) => app.update({ precision })}
         />
         <Segmented
           label="Backend"

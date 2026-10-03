@@ -267,13 +267,14 @@ def main():
 
     for sub in ("segments", "audio", "done"):
         os.makedirs(os.path.join(out, sub), exist_ok=True)
-    encoder = load_encoder(args.encoder, args.device)
-    started = time.time()
+    encoder, started = None, time.time()
     for i, path in enumerate(recordings, 1):
         name = os.path.splitext(os.path.basename(path))[0]
         done = os.path.join(out, "done", name + ".tsv")
         if os.path.exists(done):
             continue
+        if encoder is None:  # only when there's work left: a re-run over finished data is quick
+            encoder = load_encoder(args.encoder, args.device)
         rows = prepare_recording(path, out, encoder, args.device)
         with open(done + ".tmp", "w", newline="") as f:  # rename after writing: a crash can't leave half a list
             writer = csv.DictWriter(f, FIELDS, delimiter="\t", extrasaction="ignore")

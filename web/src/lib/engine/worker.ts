@@ -1,7 +1,6 @@
 /// <reference lib="webworker" />
 // Runs the models with ONNX Runtime Web, off the page's main thread. Requests run one at a time,
-// in order. Sessions stay loaded for the current backend and precision; switching either
-// releases the others, so GPU memory holds one setup at a time.
+// in order. Sessions stay loaded for the current backend; switching it releases the others.
 import * as ort from "onnxruntime-web";
 import { download } from "../models/download";
 import type { Capabilities } from "./backend";
@@ -11,21 +10,21 @@ declare const self: DedicatedWorkerGlobalScope;
 
 const sessions = new Map<string, Promise<ort.InferenceSession>>(); // key(): setup + url
 const warmed = new Set<string>();
+const notCached = new Set<string>(); // names of models the browser wouldn't store
 
 const post = (msg: Response, transfer: Transferable[] = []) => self.postMessage(msg, transfer);
 const progress = (id: number, name: string, phase: Phase, loaded = 0, total = 1) =>
   post({ id, type: "progress", name, phase, loaded, total });
-const setupKey = (s: Setup) => `${s.backend}|${s.precision}|`;
+const setupKey = (s: Setup) => `${s.backend}|`;
 const key = (s: Setup, m: ModelRef) => setupKey(s) + m.url;
 const threads = () => (self.crossOriginIsolated ? Math.min(8, navigator.hardwareConcurrency || 4) : 1);
 
 async function capabilities(): Promise<Capabilities> {
-  const caps: Capabilities = { webgpu: false, shaderF16: false, adapter: "", threads: threads() };
+  const caps: Capabilities = { webgpu: false, adapter: "", threads: threads() };
   try {
     const adapter = await navigator.gpu?.requestAdapter();
     if (adapter) {
       caps.webgpu = true;
-      caps.shaderF16 = adapter.features.has("shader-f16");
       caps.adapter = [adapter.info?.vendor, adapter.info?.architecture].filter(Boolean).join(" ");
     }
   } catch {
@@ -54,15 +53,16 @@ function session(setup: Setup, model: ModelRef, id: number): Promise<ort.Inferen
   if (!s) {
     s = (async () => {
       let last = 0;
-      const bytes = await download(model.url, model.bytes, (loaded, total, fromCache) => {
+      const { data, cached } = await download(model.url, model.bytes, (loaded, total, fromCache) => {
         const now = performance.now();
         if (loaded === total || now - last > 100) {
           last = now;
           progress(id, model.name, fromCache ? "cached" : "download", loaded, total);
         }
       });
+      if (!cached) notCached.add(model.name);
       progress(id, model.name, "initialize");
-      return ort.InferenceSession.create(bytes, {
+      return ort.InferenceSession.create(data, {
         executionProviders: [setup.backend],
         graphOptimizationLevel: "all",
         logSeverityLevel: 3, // errors only: it warns that shape ops run on the CPU, which is intended
@@ -106,7 +106,7 @@ async function handle(req: Request) {
     } else if (req.type === "prepare") {
       await useSetup(req.setup);
       for (const encoder of req.encoders) await pair(req.setup, encoder, req.decoder, req.id);
-      post({ id: req.id, type: "done", result: null });
+      post({ id: req.id, type: "done", result: { notCached: [...notCached] } });
     } else {
       await useSetup(req.setup);
       const [enc, dec] = await pair(req.setup, req.encoder, req.decoder, req.id);

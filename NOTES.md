@@ -120,17 +120,38 @@ below speech, decaying within 50–100 ms, then quiet before the speech.
   `decoder/prepare_data.py` and `decoder/train.py`.
 - **Data:** `swe-audiobook/book1/`, 187 chapters, 15.1 h, one female narrator (average pitch about
   137 Hz).
-- **WESPER's own training code** is [rkmt/UnitFastSpeech2](https://github.com/rkmt/UnitFastSpeech2),
-  checked at commit `bd3c317`. It matches on units (the original encoder, frozen), durations
-  (1, with the duration predictor trained), and pitch and energy.
-- **Differs on purpose:**
-  - mel framing (HiFi-GAN's, which WESPER's vocoder expects)
-  - single unit padding, as at inference
-  - fine-tuning from the Google TTS decoder instead of training from scratch
-  - −20 dBFS level
-  - best checkpoint by validation loss
-- **`libs/FastSpeech2/model/modules.py`:** one-line fix. The duration predictor was skipped
-  whenever durations were given, so the training loss crashed. Inference is unchanged.
+- **WESPER's own decoder training code** is public, in Jun Rekimoto's
+  [rkmt/UnitFastSpeech2](https://github.com/rkmt/UnitFastSpeech2). These scripts were checked
+  against it at the WESPER-era commit `bd3c317` (August 2022).
+
+**The same as WESPER:**
+- **Units:** the decoder's input is WESPER's original encoder (`model-layer12-450000.pt`, frozen)
+  applied to the speaker's normal speech. The fine-tuned Swedish encoder was trained to produce
+  these same units from whispers, so the decoder gets the input it was trained on.
+- **Durations:** one unit per mel frame, with the duration predictor trained toward that. WESPER
+  relies on the duration predictor at inference. The copy of FastSpeech2 in this repo skipped it
+  during training, so the loss couldn't run; one line in `libs/FastSpeech2/model/modules.py` now
+  runs it on its inference input. The inference path is unchanged.
+- **Pitch and energy:**
+  - Pitch uses WORLD's DIO + StoneMask, with unvoiced stretches interpolated, and utterances with
+    no voiced frames are dropped. Energy is the norm of each frame's spectrum.
+  - Both are normalized over the whole dataset: mean and std fitted on each utterance's values
+    without outliers, and `stats.json` in FastSpeech2's [min, max, mean, std] format.
+  - When starting from the Google TTS decoder, its pitch and energy bins are replaced by the new
+    speaker's.
+- **Model, loss and learning-rate schedule:** the repo's own FastSpeech2 code and
+  `config/my_train16k_LJ.yaml`: Adam, warmup 4,000 steps, peak learning rate about 1e-3,
+  gradient clipping at 1.0.
+
+**Deliberately different:**
+
+| | WESPER | Here | Why |
+|---|---|---|---|
+| Mel framing | FastSpeech2's `TacotronSTFT` (centered on sample t·320) | HiFi-GAN's (centered on t·320 + 160) | WESPER's own vocoder expects HiFi-GAN framing: round-trip error 0.24 vs 0.31–0.35, and Tacotron framing comes out about 130–160 samples late. HiFi-GAN framing also lines up exactly with the units. Scale and log are the same. |
+| Unit padding | padded twice in training (shifted 40 samples) | padded once | Matches how WESPER computes units at inference. |
+| Starting point | from scratch per voice (the released decoders: 114k–421k steps, batch 32) | fine-tuned from the Google TTS decoder | Much faster. Use `--init none` (and more steps) to train from scratch like WESPER. |
+| Loudness | none: audio used as loaded | each utterance at −20 dBFS speech level | The same level WESPER's input is normalized to here. The paper doesn't mention levels. |
+| Best checkpoint | lowest loss on a single training batch | lowest validation loss | Validation is a more reliable measure. |
 - **WESPER's `vocoder_infer`** casts to int16 with `astype`, which wraps around rather than clips
   above full scale. `decoder/train.py` writes its samples from the vocoder's float output instead.
 - **The English decoder is the bottleneck:** normal Swedish speech through WESPER's original

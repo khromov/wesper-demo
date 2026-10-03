@@ -1,9 +1,7 @@
 // models.json, written by web/export_models.py: which models exist, their files, and how each
 // encoder's input level is set.
 
-export type Precision = "fp16" | "fp32";
 export type Backend = "webgpu" | "wasm";
-export const PRECISIONS: Precision[] = ["fp16", "fp32"];
 
 export interface ModelFile {
   path: string;
@@ -15,7 +13,7 @@ export interface ModelEntry {
   id: string;
   label: string;
   description: string;
-  files: Record<Precision, ModelFile>;
+  file: ModelFile;
 }
 
 export interface EncoderEntry extends ModelEntry {
@@ -25,7 +23,7 @@ export interface EncoderEntry extends ModelEntry {
 }
 
 export interface Manifest {
-  version: 1;
+  version: 2;
   sampleRate: number;
   hop: number;
   maxSeconds: number;
@@ -43,16 +41,14 @@ function fail(msg: string): never {
 function checkEntry(e: unknown, where: string): asserts e is ModelEntry {
   const o = e as Partial<ModelEntry>;
   if (!o || typeof o.id !== "string" || typeof o.label !== "string") fail(`${where} needs an id and a label`);
-  for (const p of PRECISIONS) {
-    const f = o.files?.[p];
-    if (!f || typeof f.path !== "string" || !(f.bytes > 0) || !/^[0-9a-f]{64}$/.test(f.sha256 ?? ""))
-      fail(`${where} ${o.id} has no valid ${p} file`);
-  }
+  const f = o.file;
+  if (!f || typeof f.path !== "string" || !(f.bytes > 0) || !/^[0-9a-f]{64}$/.test(f.sha256 ?? ""))
+    fail(`${where} ${o.id} has no valid file`);
 }
 
 export function parseManifest(json: unknown): Manifest {
   const m = json as Partial<Manifest>;
-  if (!m || m.version !== 1) fail(`unsupported version ${m?.version}`);
+  if (!m || m.version !== 2) fail(`unsupported version ${m?.version}`);
   if (m.sampleRate !== 16000 || m.hop !== 320) fail(`expected 16 kHz audio and 320-sample frames`);
   if (!(typeof m.maxSeconds === "number" && m.maxSeconds > 0)) fail("maxSeconds is missing");
   if (!m.encoders?.length) fail("no encoders");

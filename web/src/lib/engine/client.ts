@@ -1,6 +1,6 @@
 // The page's side of the inference worker: one promise per request, plus progress callbacks.
 import type { Capabilities } from "./backend";
-import type { ConvertResult, ModelRef, Phase, Request, Response, Setup } from "./protocol";
+import type { ConvertResult, ModelRef, Phase, PrepareResult, Request, Response, Setup } from "./protocol";
 
 export type Progress = (name: string, phase: Phase, loaded: number, total: number) => void;
 type Pending = { resolve: (v: unknown) => void; reject: (e: Error) => void; onProgress?: Progress };
@@ -39,7 +39,7 @@ export class Engine {
     return this.call({ type: "capabilities" });
   }
 
-  prepare(setup: Setup, encoders: ModelRef[], decoder: ModelRef, onProgress?: Progress): Promise<null> {
+  prepare(setup: Setup, encoders: ModelRef[], decoder: ModelRef, onProgress?: Progress): Promise<PrepareResult> {
     return this.call({ type: "prepare", setup, encoders, decoder }, onProgress);
   }
 

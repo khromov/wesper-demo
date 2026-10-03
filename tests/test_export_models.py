@@ -151,18 +151,19 @@ class ExportSmoke(unittest.TestCase):
 
             manifest = json.load(open(os.path.join(out, "models.json")))
             self.assertEqual([e["id"] for e in manifest["encoders"]], ["sv", "original"] if has_sv else ["original"])
-            self.assertEqual((manifest["sampleRate"], manifest["hop"]), (16000, 320))
+            self.assertEqual((manifest["version"], manifest["sampleRate"], manifest["hop"]), (2, 16000, 320))
             original = manifest["encoders"][-1]
             self.assertEqual((original["targetDbfs"], original["maxGainDb"]), (None, None))
             if has_sv:
                 self.assertEqual((manifest["encoders"][0]["targetDbfs"], manifest["encoders"][0]["maxGainDb"]), (-20.0, 40.0))
+            self.assertEqual(sorted(f for f in os.listdir(out) if f.endswith(".onnx")),
+                             sorted(f"encoder-{e['id']}.onnx" for e in manifest["encoders"]) + ["decoder-googletts.onnx"])
             for entry in manifest["encoders"] + manifest["decoders"]:
-                for precision in ("fp32", "fp16"):
-                    info = entry["files"][precision]
-                    path = os.path.join(out, info["path"])
-                    self.assertEqual(os.path.getsize(path), info["bytes"])
-                    self.assertEqual(hashlib.sha256(open(path, "rb").read()).hexdigest(), info["sha256"])
-                    self.assertTrue(entry["checks"][precision])
+                info = entry["file"]
+                path = os.path.join(out, info["path"])
+                self.assertEqual(os.path.getsize(path), info["bytes"])
+                self.assertEqual(hashlib.sha256(open(path, "rb").read()).hexdigest(), info["sha256"])
+                self.assertEqual(len(entry["checks"]), 2)  # both test clips
 
 
 if __name__ == "__main__":

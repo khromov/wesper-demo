@@ -65,7 +65,6 @@
         <div class="what">
           <span>
             {out.encoder.label}
-            <span class="chip">{out.precision}</span>
             <span class="chip">{backendName[out.backend]}</span>
           </span>
           <span class="muted small">
@@ -84,7 +83,7 @@
         </div>
         {#if out.samples}
           {@const samples = out.samples}
-          <button class="dl" onclick={() => download(samples, `take${take.id}-${out.encoder.id}-${out.precision}-${out.backend}.wav`)} aria-label="Download {out.encoder.label}">⤓</button>
+          <button class="dl" onclick={() => download(samples, `take${take.id}-${out.encoder.id}-${out.backend}.wav`)} aria-label="Download {out.encoder.label}">⤓</button>
         {/if}
       </li>
     {/each}

@@ -1,2 +1,3 @@
+# torch.onnx.export (torch 2.0) imports onnx; onnxruntime runs the export's checks against PyTorch
 onnx==1.19.1
 onnxruntime==1.23.2
