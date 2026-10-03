@@ -1,0 +1,60 @@
+# Builds the browser demo in web/ and publishes it to GitHub Pages. The models aren't in the repo:
+# the site loads them from the folder in the WESPER_MODELS_URL repository variable (see web/README.md).
+name: Web demo on GitHub Pages
+
+on:
+  push:
+    branches: [swedish]
+    paths: ["web/**", "sample_whisper.wav", ".github/workflows/pages.yml"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - name: Check that the models URL is set
+        env:
+          MODELS_URL: ${{ vars.WESPER_MODELS_URL }}
+        run: |
+          if [ -z "$MODELS_URL" ]; then
+            echo "::error::Set the WESPER_MODELS_URL repository variable to the URL of the folder holding models.json and the .onnx files (see web/README.md)."
+            exit 1
+          fi
+        working-directory: .
+      - uses: actions/checkout@v7
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.2
+      - run: bun install --frozen-lockfile
+      - run: bun test src
+      - run: bun run check
+      - run: bun run build
+        env:
+          VITE_MODELS_URL: ${{ vars.WESPER_MODELS_URL }}
+      - uses: actions/upload-pages-artifact@v5
+        with:
+          path: web/dist
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v5

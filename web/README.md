@@ -34,19 +34,47 @@ stored, with a link to clear it. Private windows don't allow that much storage, 
 download on every visit, and the app says so. Files from earlier exports are deleted from the
 cache on load.
 
+## Publishing on GitHub Pages
+
+`.github/workflows/pages.yml` builds the app on each push to the `swedish` branch that touches
+`web/`, and publishes it to https://khromov.github.io/wesper-demo/. It can also be started by hand
+(Actions → *Web demo on GitHub Pages* → *Run workflow*). The models are too big for the repo and
+for Pages, so they live elsewhere:
+
+1. Upload the four files in `web/public/models/` to one public folder (e.g. on S3):
+   `models.json`, `encoder-sv.onnx`, `encoder-original.onnx` and `decoder-googletts.onnx`. After
+   every re-export, upload all four again: `models.json` holds the other files' sizes and hashes.
+2. Allow the site to read them (CORS). On S3:
+   ```json
+   [{ "AllowedOrigins": ["https://khromov.github.io", "http://localhost:5173"],
+      "AllowedMethods": ["GET", "HEAD"], "AllowedHeaders": ["*"], "MaxAgeSeconds": 86400 }]
+   ```
+3. Point the build at the folder: `gh variable set WESPER_MODELS_URL --body https://…/folder/`.
+   The workflow fails with a message until this is set.
+
+To try the hosted models locally: `VITE_MODELS_URL=https://…/folder/ bun run dev`.
+
+GitHub Pages can't send the COOP/COEP headers that WASM needs for threads, so the page loads
+[coi-serviceworker](https://github.com/gzuidhof/coi-serviceworker), which adds them. On a first
+visit the page reloads once for that. Private windows get no service worker, so WASM runs
+single-threaded there (WebGPU is unaffected).
+
 ## Tests
 
 ```sh
 bun test src                  # level normalization, WAV, manifest, backend choice (~0.2 s)
 bun run check                 # svelte-check / TypeScript
 bun run test:e2e              # the app in Chrome with a fake microphone (~1-2 min, needs the models)
+bun run test:e2e --pages      # the same on a build set up like GitHub Pages, models on another origin
 cd .. && .venv/bin/python -m unittest tests.test_export_models tests.test_web_level_fixture -v   # ~40 s
 WESPER_EXPORT_SMOKE=1 .venv/bin/python -m unittest tests.test_export_models -v                   # + full export, ~2 min
 ```
 
 The end-to-end test plays `sample_whisper.wav` as the microphone. It checks push-to-talk with the
 mouse and with Space, file upload, both encoders, WebGPU and WASM (which must agree), that settings
-survive a reload, the cache cleanup, and the private-window message.
+survive a reload, the cache cleanup, and the private-window message. With `--pages`, the build is
+served under `/wesper-demo/` without COOP/COEP headers (as GitHub Pages does), and the models from a
+second origin with CORS (as S3 does); it also checks that the service worker gives WASM its threads.
 
 ## How it works
 
@@ -71,13 +99,13 @@ normalized to the level it was trained on; the original gets it unchanged, as in
   disabled: noise suppression removes whispers, and gain changes what the encoder hears.
 - **Cross-origin isolation.** WASM needs the `Cross-Origin-Opener-Policy: same-origin` and
   `Cross-Origin-Embedder-Policy: require-corp` headers to use threads. The dev and preview servers
-  send them. On another host, add both headers (GitHub Pages can't; Netlify, Cloudflare Pages or a
-  Hugging Face Space can). Without them WASM runs single-threaded, and the app says so.
+  send them; on GitHub Pages, coi-serviceworker adds them (see above). Without them WASM runs
+  single-threaded, and the app says so.
 - **ONNX Runtime's JSEP build** (`ort.min.mjs` plus `public/ort/*.jsep.*`, copied on
-  `bun install`). Its newer native WebGPU build gave NaN audio from the decoder in Chrome 154.
-- **Models elsewhere:** set `VITE_MODELS_URL` (e.g. a Hugging Face repo's `resolve/main/` URL) to
-  load them from another server; it must send CORS headers. `bun run build` otherwise copies
-  `public/models/` into `dist/` (956 MB).
+  `bun install` by `scripts/copy-vendor.ts`). Its newer native WebGPU build gave NaN audio from the decoder in Chrome 154.
+- **Models elsewhere:** `VITE_MODELS_URL` loads them from another server, which must send CORS
+  headers; the build then leaves out `public/models/`. Without it, `bun run build` copies the
+  models into `dist/` (956 MB).
 
 ### Measured (Chrome 154, Apple M3, 5.8 s whisper)
 

@@ -107,6 +107,10 @@ export class App {
   private prepareRun = 0;
 
   async init() {
+    // On GitHub Pages a first visit reloads once, to get WASM threads (index.html). Wait for that
+    // rather than start downloads it would cut off.
+    const sw = navigator.serviceWorker;
+    if (!crossOriginIsolated && sw && !sw.controller) await Promise.race([sw.ready, new Promise((r) => setTimeout(r, 3000))]);
     try {
       const res = await fetch(new URL("models.json", MODELS_URL));
       if (!res.ok) throw new Error(`No models at ${MODELS_URL} (HTTP ${res.status}). Export them with: .venv/bin/python web/export_models.py`);

@@ -4,7 +4,7 @@
   "version": "0.1.0",
   "type": "module",
   "scripts": {
-    "postinstall": "bun scripts/copy-ort.ts",
+    "postinstall": "bun scripts/copy-vendor.ts",
     "dev": "vite",
     "build": "vite build",
     "preview": "vite preview",
@@ -20,6 +20,7 @@
     "@tsconfig/svelte": "^5.0.8",
     "@types/bun": "^1.4.2",
     "@webgpu/types": "^0.1.74",
+    "coi-serviceworker": "^0.1.7",
     "playwright-core": "^1.63.0",
     "svelte": "^5.57.1",
     "svelte-check": "^4.7.6",

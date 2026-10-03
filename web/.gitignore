@@ -1,5 +1,6 @@
 node_modules/
 dist/
-# generated: models by export_models.py, ONNX Runtime's wasm files by scripts/copy-ort.ts
+# generated: models by export_models.py, the rest by scripts/copy-vendor.ts
 public/models/
 public/ort/
+public/coi-serviceworker.min.js

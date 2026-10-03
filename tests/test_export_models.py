@@ -157,7 +157,7 @@ class ExportSmoke(unittest.TestCase):
             if has_sv:
                 self.assertEqual((manifest["encoders"][0]["targetDbfs"], manifest["encoders"][0]["maxGainDb"]), (-20.0, 40.0))
             self.assertEqual(sorted(f for f in os.listdir(out) if f.endswith(".onnx")),
-                             sorted(f"encoder-{e['id']}.onnx" for e in manifest["encoders"]) + ["decoder-googletts.onnx"])
+                             sorted([f"encoder-{e['id']}.onnx" for e in manifest["encoders"]] + ["decoder-googletts.onnx"]))
             for entry in manifest["encoders"] + manifest["decoders"]:
                 info = entry["file"]
                 path = os.path.join(out, info["path"])

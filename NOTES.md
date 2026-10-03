@@ -114,6 +114,32 @@ below speech, decaying within 50–100 ms, then quiet before the speech.
   decay, ±3 dB random gain. Validation is the distance to the teacher's normal-speech units, for
   whispered input (should drop) and normal input (should stay near 0).
 
+## Encoder evaluation (run `n2w-finetune`, `encoder_best.pt` at step 9000)
+
+- **Setup (`colab/evaluate.py`):** 296 held-out validation clips, from 296 speakers that were
+  never trained on and never used to pick the checkpoint. Each condition is transcribed with
+  KB-Whisper (small) and scored as character and word error rate against the sentence. Results
+  are in `colab/data/runs/n2w-finetune/eval/`.
+- **Unit distance to the normal recording's original units:** whisper input 0.192 with the
+  original encoder, 0.112 fine-tuned (closer on 98% of clips). Normal input 0.072 fine-tuned.
+
+| Condition | CER | WER |
+|---|---|---|
+| Normal recording | 2.4% | 5.9% |
+| Normal2Whisper recording | 7.7% | 16.5% |
+| Normal → original encoder → English decoder | 37.5% | 66.7% |
+| Whisper → original encoder → English decoder | 55.5% | 92.6% |
+| Whisper → fine-tuned encoder → English decoder | 37.8% | 67.2% |
+| Normal → fine-tuned encoder → English decoder | 29.7% | 54.4% |
+
+- **The fine-tuned encoder cuts whisper conversion errors by 17.6 points** (95% interval 12.6 to
+  22.2). It is better on 226 clips, worse on 57, and the same on 13. Whispers now convert as
+  intelligibly as normal speech did with the original encoder.
+- **The English decoder is now the limit:** even normal speech loses about a third of its
+  characters. A Swedish decoder (below) is the next step.
+- **Caveat:** the test whispers are Normal2Whisper pseudo-whispers like the training data, not
+  real whispers. Real Swedish whispers still need checking, e.g. in the GUI.
+
 ## Decoder: a Swedish voice
 
 - **Guide and scripts:** [HOW_TO_TRAIN_DECODER.md](HOW_TO_TRAIN_DECODER.md),

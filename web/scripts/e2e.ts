@@ -8,6 +8,7 @@
 //
 //   bun run test:e2e            # against the dev server (needs the models: see README.md)
 //   bun run test:e2e --preview  # against a production build (vite build + vite preview)
+//   bun run test:e2e --pages    # a production build set up like GitHub Pages + models on S3
 //   bun run test:e2e --headed   # watch it happen
 // Each step has a timeout, and the whole run is killed after 15 minutes.
 import { spawn } from "node:child_process";
@@ -33,26 +34,79 @@ if (!existsSync(join(WEB, "public", "models", "models.json"))) {
   process.exit(1);
 }
 
-const PREVIEW = process.argv.includes("--preview");
-if (PREVIEW) {
-  const build = Bun.spawnSync(["bunx", "vite", "build"], { cwd: WEB, timeout: 5 * 60_000 });
-  if (build.exitCode !== 0) {
-    console.error(`e2e: build failed\n${build.stdout}${build.stderr}`);
+// dev: Vite's dev server. preview: a production build on Vite's preview server. pages: a
+// production build as GitHub Pages serves it, under /wesper-demo/ and without the COOP/COEP
+// headers, with the models on another origin that sends CORS headers, as S3 does.
+const MODE = process.argv.includes("--pages") ? "pages" : process.argv.includes("--preview") ? "preview" : "dev";
+const MODELS_PORT = 5299;
+const APP_URL = `http://localhost:${PORT}/${MODE === "pages" ? "wesper-demo/" : ""}`;
+
+function build(env: Record<string, string> = {}) {
+  const r = Bun.spawnSync(["bunx", "vite", "build"], { cwd: WEB, env: { ...process.env, ...env }, timeout: 5 * 60_000 });
+  if (r.exitCode !== 0) {
+    console.error(`e2e: build failed\n${r.stdout}${r.stderr}`);
     process.exit(1);
   }
 }
-const server = spawn("bunx", ["vite", ...(PREVIEW ? ["preview"] : []), "--port", String(PORT), "--strictPort"], {
-  cwd: WEB,
-  stdio: ["ignore", "pipe", "pipe"],
-});
+
+/** Serves the files in dir under the URL path prefix, with extra headers. */
+function serveStatic(port: number, dir: string, prefix: string, headers: Record<string, string> = {}) {
+  return Bun.serve({
+    port,
+    async fetch(req) {
+      const path = decodeURIComponent(new URL(req.url).pathname);
+      const file = Bun.file(join(dir, path.slice(prefix.length) || "index.html"));
+      if (!path.startsWith(prefix) || !(await file.exists())) return new Response("not found", { status: 404, headers });
+      return new Response(file, { headers });
+    },
+  });
+}
+
 let serverLog = "";
-server.stdout.on("data", (d) => (serverLog += d));
-server.stderr.on("data", (d) => (serverLog += d));
+let stopServers: () => void;
+if (MODE === "pages") {
+  build({ VITE_MODELS_URL: `http://localhost:${MODELS_PORT}/` });
+  if (existsSync(join(WEB, "dist", "models"))) {
+    console.error("e2e: the build still contains models/, though they're hosted elsewhere");
+    process.exit(1);
+  }
+  const site = serveStatic(PORT, join(WEB, "dist"), "/wesper-demo/");
+  const models = serveStatic(MODELS_PORT, join(WEB, "public", "models"), "/", { "Access-Control-Allow-Origin": "*" });
+  stopServers = () => {
+    site.stop(true);
+    models.stop(true);
+  };
+} else {
+  if (MODE === "preview") build();
+  const server = spawn("bunx", ["vite", ...(MODE === "preview" ? ["preview"] : []), "--port", String(PORT), "--strictPort"], {
+    cwd: WEB,
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  server.stdout.on("data", (d) => (serverLog += d));
+  server.stderr.on("data", (d) => (serverLog += d));
+  stopServers = () => server.kill();
+}
+
+/** Opens the app. On the Pages setup, coi-serviceworker reloads it once to add the headers;
+ *  with `isolated`, this waits for that. */
+async function open(page: Page, isolated = true) {
+  await page.goto(APP_URL);
+  if (MODE !== "pages" || !isolated) return;
+  for (let i = 0; i < 150; i++) {
+    try {
+      if (await page.evaluate(() => crossOriginIsolated)) return;
+    } catch {
+      // the page is reloading
+    }
+    await new Promise((r) => setTimeout(r, 200));
+  }
+  throw new Error("coi-serviceworker didn't make the page cross-origin isolated");
+}
 
 async function waitForServer() {
   for (let i = 0; i < 300; i++) {
     try {
-      if ((await fetch(`http://localhost:${PORT}/`)).ok) return;
+      if ((await fetch(APP_URL)).ok) return;
     } catch {
       // not up yet
     }
@@ -130,8 +184,19 @@ async function waitForOutputs(page: Page, takeId: number, count: number) {
   return (await takes(page)).find((t) => t.id === takeId)!;
 }
 
-const waitForReady = (page: Page) =>
-  page.waitForFunction(() => (window as any).__wesper.ready, null, { timeout: STEP_MS, polling: 200 });
+/** Waits until the models are loaded, through any reload in between. */
+async function waitForReady(page: Page) {
+  const until = Date.now() + STEP_MS;
+  while (Date.now() < until) {
+    try {
+      if (await page.evaluate(() => (window as any).__wesper?.ready)) return;
+    } catch {
+      // the page is reloading
+    }
+    await new Promise((r) => setTimeout(r, 200));
+  }
+  throw new Error("the models didn't load");
+}
 
 function check(cond: unknown, msg: string) {
   if (!cond) throw new Error(msg);
@@ -172,7 +237,7 @@ try {
   const consoleErrors: string[] = [];
   page.on("console", (m) => (m.type() === "error" || m.text().includes("not caching")) && consoleErrors.push(m.text()));
   page.on("pageerror", (e) => consoleErrors.push(e.message));
-  await page.goto(`http://localhost:${PORT}/`);
+  await open(page);
 
   console.log("defaults and model loading");
   await waitForReady(page);
@@ -246,7 +311,7 @@ try {
   const incognito = await chromium.launch({ channel: "chrome", headless: !process.argv.includes("--headed"), args: ["--enable-unsafe-webgpu"] });
   try {
     const p = await incognito.newPage();
-    await p.goto(`http://localhost:${PORT}/`);
+    await open(p, false); // private windows get no service worker, so no isolation on Pages
     await waitForReady(p);
     const notice: string = await p.evaluate(() => (window as any).__wesper.notice);
     check(/didn't let the page keep .*encoder/.test(notice), `says the models will download again: "${notice}"`);
@@ -259,7 +324,7 @@ try {
 } finally {
   await browser.close();
   rmSync(profile, { recursive: true, force: true });
-  server.kill();
+  stopServers();
   clearTimeout(watchdog);
 }
 console.log(failed ? "e2e failed" : "e2e passed");
