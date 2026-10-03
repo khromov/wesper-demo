@@ -50,6 +50,16 @@ mac$ client_direct_sv.sh # encoder fine-tuned for Swedish whispers (see HOW_TO_T
 Choose the microphone and output device in the GUI's dropdowns, or pass `--sd N` to start
 with input device `N` (the device list is printed at startup).
 
+### In the browser
+The same push-to-talk demo, running entirely in the browser (WebGPU, or WebAssembly as a fallback),
+with the Swedish and original encoders side by side. See [web/README.md](web/README.md).
+
+```sh
+.venv/bin/pip install -r web/requirements-export.txt
+.venv/bin/python web/export_models.py   # ONNX models into web/public/models/
+cd web && bun install && bun run dev
+```
+
 ### Software Dependency
 
 Some source codes from the following libraries are used with modification.

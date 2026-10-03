@@ -1,0 +1,2 @@
+onnx==1.19.1
+onnxruntime==1.23.2

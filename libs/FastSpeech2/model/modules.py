@@ -132,6 +132,9 @@ class VarianceAdaptor(nn.Module):
             x = x + energy_embedding
 
         if duration_target is not None:
+            # Training: predict durations here too, so the loss can train the duration predictor.
+            # It sees the same input as at inference (the else branch below), where WESPER uses it.
+            log_duration_prediction = self.duration_predictor(x, src_mask)
             #print("### x", x, duration_target, max_len) ### rkmt 2022.7.3
 
             ## bypasss length_regulator (rkmt 2022.8.3)

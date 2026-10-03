@@ -172,7 +172,8 @@ def kb_whisper(model_id):
     def transcribe(waves):
         # Common Voice sentences need well under 128 tokens. The cap stops a hallucinating
         # transcript from holding up its whole batch until Whisper's 448-token limit.
-        outs = asr([{"raw": w, "sampling_rate": SR} for w in waves], batch_size=8,
+        # One clip at a time: measured ~3x faster than batches of 8 on Apple GPUs (MPS).
+        outs = asr([{"raw": w, "sampling_rate": SR} for w in waves], batch_size=1,
                    generate_kwargs={"language": "sv", "task": "transcribe", "max_new_tokens": 128})
         return [o["text"] for o in outs]
     return transcribe

@@ -1,0 +1,132 @@
+:root {
+  --bg: #f7f7f8;
+  --surface: #ffffff;
+  --surface-2: #f0f0f3;
+  --border: #e2e2e7;
+  --text: #1b1b1f;
+  --muted: #64646e;
+  --accent: #5b5bd6;
+  --accent-text: #ffffff;
+  --accent-soft: #ededfc;
+  --record: #e5484d;
+  --record-soft: #fdecec;
+  --ok: #2b9a66;
+  --warn-bg: #fff7e0;
+  --warn-text: #7a5a00;
+  --error-bg: #fdecec;
+  --error-text: #b4232a;
+  --radius: 12px;
+  --mono: ui-monospace, SFMono-Regular, Menlo, monospace;
+  color-scheme: light;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #111113;
+    --surface: #19191c;
+    --surface-2: #222226;
+    --border: #2e2e33;
+    --text: #ededef;
+    --muted: #a0a0ab;
+    --accent: #8080f0;
+    --accent-text: #0b0b20;
+    --accent-soft: #23234a;
+    --record: #ff6369;
+    --record-soft: #3b1219;
+    --ok: #3dd68c;
+    --warn-bg: #2c2205;
+    --warn-text: #f0c000;
+    --error-bg: #3b1219;
+    --error-text: #ff9592;
+    color-scheme: dark;
+  }
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font: 15px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+
+button,
+select,
+input {
+  font: inherit;
+  color: inherit;
+}
+
+button {
+  cursor: pointer;
+}
+
+button:disabled {
+  cursor: default;
+  opacity: 0.5;
+}
+
+:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 16px;
+}
+
+.muted {
+  color: var(--muted);
+}
+
+.small {
+  font-size: 13px;
+}
+
+.mono {
+  font-family: var(--mono);
+  font-size: 13px;
+}
+
+.button {
+  border: 1px solid var(--border);
+  background: var(--surface);
+  border-radius: 8px;
+  padding: 6px 12px;
+}
+
+.button:hover:not(:disabled) {
+  background: var(--surface-2);
+}
+
+.banner {
+  border-radius: 8px;
+  padding: 10px 12px;
+  display: flex;
+  gap: 12px;
+  align-items: flex-start;
+  justify-content: space-between;
+}
+
+.banner.warn {
+  background: var(--warn-bg);
+  color: var(--warn-text);
+}
+
+.banner.error {
+  background: var(--error-bg);
+  color: var(--error-text);
+}
+
+.banner button {
+  background: none;
+  border: none;
+  padding: 0 4px;
+  color: inherit;
+}

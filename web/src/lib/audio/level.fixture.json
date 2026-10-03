@@ -1,0 +1,38 @@
+{
+  "targetDbfs": -20.0,
+  "maxGainDb": 40.0,
+  "signals": {
+    "silence": {
+      "speechDbfs": -120.0,
+      "gainDb": 40.0
+    },
+    "short": {
+      "speechDbfs": -120.0,
+      "gainDb": 40.0
+    },
+    "tone_padded": {
+      "speechDbfs": -23.01029993788081,
+      "gainDb": 3.0102999378808093
+    },
+    "noise": {
+      "speechDbfs": -44.75885469221247,
+      "gainDb": 24.758854692212473
+    },
+    "tone_click": {
+      "speechDbfs": -29.029361168176003,
+      "gainDb": 9.029361168176003
+    },
+    "modulated": {
+      "speechDbfs": -20.40870496531864,
+      "gainDb": 0.4087049653186412
+    },
+    "quiet_noise": {
+      "speechDbfs": -104.71395564224808,
+      "gainDb": 40.0
+    },
+    "sample_whisper": {
+      "speechDbfs": -37.9781203694825,
+      "gainDb": 17.978120369482497
+    }
+  }
+}

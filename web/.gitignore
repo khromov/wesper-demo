@@ -1,0 +1,5 @@
+node_modules/
+dist/
+# generated: models by export_models.py, ONNX Runtime's wasm files by scripts/copy-ort.ts
+public/models/
+public/ort/

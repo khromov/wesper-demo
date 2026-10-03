@@ -114,6 +114,29 @@ below speech, decaying within 50–100 ms, then quiet before the speech.
   decay, ±3 dB random gain. Validation is the distance to the teacher's normal-speech units, for
   whispered input (should drop) and normal input (should stay near 0).
 
+## Decoder: a Swedish voice
+
+- **Guide and scripts:** [HOW_TO_TRAIN_DECODER.md](HOW_TO_TRAIN_DECODER.md),
+  `decoder/prepare_data.py` and `decoder/train.py`.
+- **Data:** `swe-audiobook/book1/`, 187 chapters, 15.1 h, one female narrator (average pitch about
+  137 Hz).
+- **WESPER's own training code** is [rkmt/UnitFastSpeech2](https://github.com/rkmt/UnitFastSpeech2),
+  checked at commit `bd3c317`. It matches on units (the original encoder, frozen), durations
+  (1, with the duration predictor trained), and pitch and energy.
+- **Differs on purpose:**
+  - mel framing (HiFi-GAN's, which WESPER's vocoder expects)
+  - single unit padding, as at inference
+  - fine-tuning from the Google TTS decoder instead of training from scratch
+  - −20 dBFS level
+  - best checkpoint by validation loss
+- **`libs/FastSpeech2/model/modules.py`:** one-line fix. The duration predictor was skipped
+  whenever durations were given, so the training loss crashed. Inference is unchanged.
+- **WESPER's `vocoder_infer`** casts to int16 with `astype`, which wraps around rather than clips
+  above full scale. `decoder/train.py` writes its samples from the vocoder's float output instead.
+- **The English decoder is the bottleneck:** normal Swedish speech through WESPER's original
+  encoder and English decoder transcribes at 37.5% CER, against 2.4% for the recordings
+  themselves.
+
 ## Tests
 
 ```sh

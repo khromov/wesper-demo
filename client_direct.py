@@ -261,6 +261,7 @@ class MyGUI(tk.Frame):
             w2n = self.client.w2n
             level = "unchanged" if w2n.target_dbfs is None else f"normalized to {w2n.target_dbfs} dBFS speech level"
             self.log(f"encoder: {os.path.basename(args.hubert)}, input {level}")
+            self.log(f"decoder: {os.path.basename(args.fastspeech2)}")
         else:
             self.client = MyAudioClient(host=host)
 
