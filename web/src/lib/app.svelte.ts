@@ -112,7 +112,12 @@ export class App {
     const sw = navigator.serviceWorker;
     if (!crossOriginIsolated && sw && !sw.controller) await Promise.race([sw.ready, new Promise((r) => setTimeout(r, 3000))]);
     try {
-      const res = await fetch(new URL("models.json", MODELS_URL));
+      const manifestUrl = new URL("models.json", MODELS_URL);
+      const res = await fetch(manifestUrl).catch((e) => {
+        const crossOrigin = manifestUrl.origin !== location.origin;
+        throw new Error(`Couldn't load ${manifestUrl} (${e instanceof Error ? e.message : e}).` +
+          (crossOrigin ? ` If the file exists, its server must allow this site (${location.origin}) with CORS.` : ""));
+      });
       if (!res.ok) throw new Error(`No models at ${MODELS_URL} (HTTP ${res.status}). Export them with: .venv/bin/python web/export_models.py`);
       this.manifest = parseManifest(await res.json());
       this.caps = await this.engine.capabilities();

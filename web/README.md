@@ -52,6 +52,10 @@ for Pages, so they live elsewhere:
 3. Point the build at the folder: `gh variable set WESPER_MODELS_URL --body https://…/folder/`.
    The workflow fails with a message until this is set.
 
+Behind a CDN (the DigitalOcean Spaces CDN is Cloudflare), purge the folder's cache after changing
+the CORS rules or re-uploading. The CDN keeps files for 7 days and ignores `Vary: Origin`, so it
+can keep serving copies without the CORS header, or `models.json` from the previous export.
+
 To try the hosted models locally: `VITE_MODELS_URL=https://…/folder/ bun run dev`.
 
 GitHub Pages can't send the COOP/COEP headers that WASM needs for threads, so the page loads
