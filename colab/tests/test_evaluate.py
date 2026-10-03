@@ -142,6 +142,32 @@ class RunAsr(unittest.TestCase):
         self.assertEqual(chars, sum(len(ev.normalize_text(t)) for _, _, t in self.refs))
 
 
+class Resampling(unittest.TestCase):
+    """Conversions through BigVGAN are 22.05 kHz; the recognizer needs 16 kHz."""
+
+    def test_reads_16k_as_is_and_resamples_other_rates(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            x16 = np.random.default_rng(0).standard_normal(16000).astype(np.float32) * 0.1
+            sf.write(os.path.join(tmp, "a.wav"), x16, 16000, subtype="FLOAT")
+            np.testing.assert_array_equal(ev.read_16k(os.path.join(tmp, "a.wav")), x16)
+            t = np.arange(22050) / 22050
+            sf.write(os.path.join(tmp, "b.wav"), (0.5 * np.sin(2 * np.pi * 440 * t)).astype(np.float32), 22050)
+            y = ev.read_16k(os.path.join(tmp, "b.wav"))
+            self.assertEqual(len(y), 16000)
+            spectrum = np.abs(np.fft.rfft(y))
+            self.assertAlmostEqual(np.argmax(spectrum) * 16000 / len(y), 440, delta=2)  # same pitch after resampling
+
+    def test_asr_gets_16k_audio_from_22k_conversions(self):
+        with tempfile.TemporaryDirectory() as out:
+            ev.write_tsv(os.path.join(out, "reference.tsv"), [{"clip": "c1", "speaker": "s", "sentence": "Hej."}],
+                         ["clip", "speaker", "sentence"])
+            os.makedirs(os.path.join(out, "whisper-ft"))
+            sf.write(os.path.join(out, "whisper-ft", "c1.wav"), np.zeros(22050, np.float32), 22050)
+            lengths = []
+            ev.run_asr(out, lambda waves: lengths.extend(len(w) for w in waves) or ["hej"] * len(waves))
+            self.assertEqual(lengths, [16000])
+
+
 ORIGINAL = os.path.expanduser("~/.cache/torch/hub/checkpoints/model-layer12-450000.pt")
 
 

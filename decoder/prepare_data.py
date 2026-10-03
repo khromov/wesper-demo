@@ -208,14 +208,18 @@ def units(encoder, x, device):
         return encoder.units(torch.from_numpy(x)[None, None].to(device))[0].float().cpu().numpy()
 
 
+def max_seconds(voc):
+    """The longest utterance: MAX_SECONDS, or less if the vocoder's frames wouldn't fit in MAX_FRAMES."""
+    return min(MAX_SECONDS, 0.98 * MAX_FRAMES * voc.frame_seconds)
+
+
 def prepare_recording(path, out_dir, encoder, device, voc=vocoders.HIFIGAN16K):
     """Segment one recording and write its utterances. Returns their manifest rows."""
     name = os.path.splitext(os.path.basename(path))[0]
     x = decode(path)  # 16 kHz: cutting, units and pitch
     xv = x if voc.sample_rate == SR else decode(path, voc.sample_rate)  # the vocoder's rate: mel and energy
-    max_seconds = min(MAX_SECONDS, 0.98 * MAX_FRAMES * voc.frame_seconds)
     rows = []
-    for k, (s, e) in enumerate(segment(x, max_s=max_seconds)):
+    for k, (s, e) in enumerate(segment(x, max_s=max_seconds(voc))):
         seg_id = f"{name}_{k:04d}"
         raw = x[s:e]
         wav, gain_db = normalize(raw)
@@ -311,7 +315,7 @@ def main():
     with open(os.path.join(out, "prep.json"), "w") as f:
         json.dump({"vocoder": voc.name, "sample_rate": voc.sample_rate, "hop": voc.hop, "n_mels": voc.n_mels,
                    "unit_sample_rate": SR, "unit_hop": HOP, "target_dbfs": TARGET_DBFS, "encoder": args.encoder,
-                   "min_seconds": MIN_SECONDS, "max_seconds": MAX_SECONDS, "mel": "hifigan"}, f, indent=1)
+                   "min_seconds": MIN_SECONDS, "max_seconds": round(max_seconds(voc), 2), "mel": "hifigan"}, f, indent=1)
 
     for split in ("train", "val"):
         part = [r for r in rows if r["split"] == split]

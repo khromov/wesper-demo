@@ -49,6 +49,24 @@ Copy `decoder/runs/sv-narrator/` back into this repo (only `decoder_best.pt`, `p
 and `stats.json` are needed), then run `./client_direct_sv.sh`. The GUI picks up the new voice
 automatically; its log shows `decoder: decoder_best.pt`.
 
+## Optional: BigVGAN instead of HiFi-GAN
+
+NVIDIA's BigVGAN (22.05 kHz) sounds clearly better than WESPER's HiFi-GAN, but it needs a decoder
+trained for it. Prepare and train into separate folders, so both versions can be compared:
+
+```sh
+python decoder/prepare_data.py swe-audiobook/book1 decoder/data/sv-narrator-bigvgan22k --vocoder bigvgan22k --device cuda
+python decoder/train.py decoder/data/sv-narrator-bigvgan22k decoder/runs/sv-narrator-bigvgan22k --device cuda
+```
+
+- **Speed:** each training step takes about 1.7× as long, because the decoder predicts 86 mel
+  frames per second instead of 50.
+- **Vocoder:** the run records its vocoder, so WESPER loads BigVGAN automatically:
+  `DECODER=decoder/runs/sv-narrator-bigvgan22k ./client_direct_sv.sh`.
+- **Checkpoint:** BigVGAN's 449 MB checkpoint downloads on first use.
+- **CPU:** BigVGAN is slow on a CPU (about 1.4× real time on a MacBook), so the GUI responds
+  more slowly than with HiFi-GAN.
+
 ## Checking the setup
 
 ```sh

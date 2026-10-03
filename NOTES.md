@@ -180,6 +180,42 @@ below speech, decaying within 50–100 ms, then quiet before the speech.
 | Best checkpoint | lowest loss on a single training batch | lowest validation loss | Validation is a more reliable measure. |
 - **WESPER's `vocoder_infer`** casts to int16 with `astype`, which wraps around rather than clips
   above full scale. `decoder/train.py` writes its samples from the vocoder's float output instead.
+
+### Vocoder option: HiFi-GAN or BigVGAN
+
+- **`vocoders.py`** describes each vocoder (sample rate, STFT and mel settings, checkpoint),
+  computes its mels, maps units onto its frames, and loads it:
+  - `hifigan16k`: WESPER's own vocoder, and the default.
+  - `bigvgan22k`: NVIDIA BigVGAN v2 `bigvgan_v2_22khz_80band_fmax8k_256x`.
+  - `bigvgan:<model>`: any other BigVGAN v2 model.
+- **BigVGAN's code** is vendored in `libs/bigvgan` (MIT; inference only, no `huggingface_hub`;
+  see `UPSTREAM_COMMIT`).
+- **How the choice flows:**
+  - `decoder/prepare_data.py --vocoder` computes the mel targets with that vocoder's settings.
+    A data folder refuses to mix vocoders.
+  - `decoder/train.py` reads the vocoder from the data and records it in the run's
+    `preprocess.yaml`.
+  - `whisper_normal.py` loads that vocoder and reports `sample_rate`. The GUI, `convert.py`,
+    `server.py` and `colab/evaluate.py` use it.
+  - Runs without a vocoder entry, like WESPER's released decoders, take exactly the old path.
+- **Frame rates:** BigVGAN-22k frames are 11.6 ms (hop 256 at 22.05 kHz) against the units' 20 ms.
+  - The decoder works at BigVGAN's frame rate. Units are linearly interpolated to the frame
+    centers (`vocoders.units_to_frames`), identically in training and at inference.
+  - Durations stay 1 per frame.
+  - Utterances are capped at 11.4 s, to stay under FastSpeech2's 1,000-frame limit.
+- **Mels:** BigVGAN computes them exactly like HiFi-GAN (tested against BigVGAN's own
+  `mel_spectrogram` to 1e-5).
+- **Round trip on narrator speech** (mel → vocoder → mel, mean abs error): **0.086** for BigVGAN,
+  against 0.24 for HiFi-GAN.
+- **Cost:** BigVGAN has 112M parameters and a 449 MB checkpoint. On a MacBook CPU it takes about
+  11 s per 8 s of audio.
+- **Preview without retraining** (`decoder/bigvgan_preview.py`):
+  - It converts a HiFi-GAN mel to an approximate BigVGAN mel: frames moved to BigVGAN's frame
+    centers, plus a per-band linear level correction fitted on 300 Common Voice clips.
+  - On held-out clips that comes within 0.187 of a real BigVGAN mel (0.240 without the
+    correction). The longer HiFi-GAN analysis window makes it slightly blurred in time.
+  - Samples are in `decoder/data/bigvgan-preview/`. Listening there, BigVGAN sounded clearly
+    better than HiFi-GAN.
 - **The English decoder is the bottleneck:** normal Swedish speech through WESPER's original
   encoder and English decoder transcribes at 37.5% CER, against 2.4% for the recordings
   themselves.
