@@ -23,6 +23,7 @@ import sys
 import tempfile
 import types
 import unittest
+import warnings
 
 import numpy as np
 import soundfile as sf
@@ -141,8 +142,13 @@ class Smoke(unittest.TestCase):
             WESPER_DIR=REPO_DIR, MAX_STEPS=4, BATCH_SIZE=2, CROP_SECONDS=1.0, WARMUP_STEPS=2,
             EVAL_EVERY=2, SAVE_EVERY=2, VAL_CLIPS=2, LISTEN_CLIPS=1, NUM_WORKERS=0,
         )
-        cls.ns, cls.out = run_notebook(cls.overrides)
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", message="Matplotlib is currently using agg")
+            cls.ns, cls.out = run_notebook(cls.overrides)
         cls.run_dir = cls.ns["RUN_DIR"]
+        # Read now: test_resumes_after_restart trains further in the same run folder.
+        with open(os.path.join(cls.run_dir, "history.json")) as f:
+            cls.history = json.load(f)
 
     @classmethod
     def tearDownClass(cls):
@@ -153,8 +159,7 @@ class Smoke(unittest.TestCase):
         self.assertIn("Done at step 4", self.out)
         for name in ("latest.pt", "encoder_best.pt", "history.json"):
             self.assertTrue(os.path.exists(os.path.join(self.run_dir, name)), name)
-        with open(os.path.join(self.run_dir, "history.json")) as f:
-            self.assertEqual([h["step"] for h in json.load(f)["val"]], [0, 2, 4])
+        self.assertEqual([h["step"] for h in self.history["val"]], [0, 2, 4])
 
     def test_best_encoder_loads_with_wespers_own_loader(self):
         # convert.py --hubert uses whisper_normal.load_hubert, so the saved file must work there.
@@ -170,7 +175,9 @@ class Smoke(unittest.TestCase):
         self.assertTrue(np.isfinite(wav).all())
 
     def test_resumes_after_restart(self):
-        _, out = run_notebook({**self.overrides, "MAX_STEPS": 6})
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", message="Matplotlib is currently using agg")
+            _, out = run_notebook({**self.overrides, "MAX_STEPS": 6})
         self.assertIn("Resuming from step 4", out)
         self.assertIn("Done at step 6", out)
 

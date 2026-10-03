@@ -50,10 +50,12 @@ Built by `colab/prepare_data.py` from validated clips:
   - Tested on real clips: adding 2 s of silence moves it 0.0 dB, trimming to speech moves it at
     most 0.9 dB, and a loud click moves it at most 1.5 dB.
   - Normalization never amplifies more than 40 dB.
-- **At inference too:** WESPER's `convert.py` and clients do no normalization; audio goes
-  straight into the encoder. Run new recordings through the notebook's `normalize()` (same
-  target) before converting, or the fine-tuned encoder sees a different level than it trained
-  on.
+- **At inference too:** fine-tuned checkpoints record `TARGET_DBFS` and `MAX_GAIN_DB` in their
+  `config`. `whisper_normal.py` (`load_hubert()`, `MyWhisper2Normal.whisper2normal()`) then
+  normalizes all input to that level, using the same `speech_dbfs()`. This covers the GUI,
+  `server.py` and `convert.py`. With the fine-tuned encoder, a whisper 20 dB quieter gives the
+  same output, to within one 16-bit step. The original encoder has no `config`, so its input is
+  unchanged.
 
 ## Touchpad thuds at the start of clips
 
@@ -103,10 +105,9 @@ below speech, decaying within 50–100 ms, then quiet before the speech.
     working, and `convert.py --hubert encoder_best.pt` works as-is.
   - The checkpoint shows WESPER's encoder was trained with the soft-HuBERT training script, but
     not its exact targets, so we match the original encoder instead of guessing them.
-- **To run it:**
-  1. Upload `colab/data/wesper-sv-n2w.tar` to Google Drive as `MyDrive/wesper-sv/wesper-sv-n2w.tar`.
-  2. Open the notebook in Colab with a GPU runtime and run all.
-  3. Checkpoints go to `MyDrive/wesper-sv/runs/<RUN_NAME>/`. Re-running resumes after a disconnect.
+- **To run it:** follow [HOW_TO_TRAIN.md](HOW_TO_TRAIN.md). In short: put the tar in a Drive
+  folder, open the notebook in Colab with a GPU, set `DRIVE_DIR`, and run all. Checkpoints go to
+  `<DRIVE_DIR>/runs/<RUN_NAME>/`, and re-running resumes after a disconnect.
 - **Outputs:** the notebook ends with before/after listening on unseen speakers, and a cell to
   upload your own whisper recording.
 - **Defaults:** 10,000 steps, batch 16 × 3 s crops, learning rate 3e-5 with warmup and cosine
@@ -118,7 +119,8 @@ below speech, decaying within 50–100 ms, then quiet before the speech.
 ```sh
 .venv/bin/python -m unittest discover -s colab/tests -v              # packer + notebook helpers (~3 s)
 WESPER_NOTEBOOK_SMOKE=1 .venv/bin/python -m unittest discover -s colab/tests -k Smoke -v
-                                      # runs the whole notebook on CPU on fake data, incl. resume
+       # runs the whole notebook on CPU on fake data, incl. resume: ~40 s once WESPER's checkpoints
+       # are cached. A watchdog dumps stacks and exits after WESPER_NOTEBOOK_SMOKE_TIMEOUT s (900).
 (cd ../toWhisper && python3 -m unittest discover -s tests -v)                       # ~1 s
 (cd ../Normal2Whisper && .venv/bin/python -m unittest discover -s tests -v)         # ~6 s
 ```

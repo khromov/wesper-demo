@@ -43,7 +43,12 @@ or
 mac$ client_direct.sh # voice trained with LJSpeech
 or
 mac$ client_direct_googletts.sh # voice trained with GoogleTTS
+or
+mac$ client_direct_sv.sh # encoder fine-tuned for Swedish whispers (see HOW_TO_TRAIN.md)
 ```
+
+Choose the microphone and output device in the GUI's dropdowns, or pass `--sd N` to start
+with input device `N` (the device list is printed at startup).
 
 ### Software Dependency
 

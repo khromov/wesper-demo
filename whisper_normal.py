@@ -26,6 +26,8 @@ from utils.model import vocoder_infer
 from libs.hubert.model import Hubert, URLS, HubertSoft
 # Hifigan
 import hifigan
+# The speech-level measure the fine-tuned encoders' training data was normalized with
+from colab.prepare_data import speech_dbfs
 
 
 def load_fastspeech2(configs, checkpoint_path=None, device='cuda'):
@@ -126,12 +128,27 @@ def load_hubert(checkpoint_path=None, rank=0, device='cuda'):
         checkpoint = torch.load(checkpoint_path, map_location=torch.device('cpu')) if device!='cuda' else torch.load(checkpoint_path)
     hubert = HubertSoft().to(device) if device!='cuda' else HubertSoft().to(rank)
 
+    # Encoders fine-tuned with colab/wesper_sv_encoder_finetune.ipynb also store their training
+    # settings, such as the speech level their input was normalized to. The original has none.
+    training_config = checkpoint.get('config') or {}
     checkpoint = checkpoint['hubert'] if checkpoint['hubert'] is not None else checkpoint
     consume_prefix_in_state_dict_if_present(checkpoint, "module.")
 
     hubert.load_state_dict(checkpoint, strict=True)
     hubert.eval().to(device)
+    hubert.training_config = training_config
     return hubert
+
+
+def normalize_level(wav, target_dbfs, max_gain_db=40.0):
+    ''' Scale audio to target_dbfs speech level, amplifying by at most max_gain_db.
+        Keeps the input's shape; the result stays float, so peaks above 1.0 are kept, not clipped.
+    '''
+    if type(wav) == torch.Tensor:
+        wav = wav.detach().cpu().numpy()
+    wav = np.asarray(wav, dtype=np.float32)
+    gain_db = min(target_dbfs - speech_dbfs(wav.reshape(-1)), max_gain_db)
+    return wav * np.float32(10 ** (gain_db / 20))
 
 
 def load_hifigan(config, checkpoint_path="./hifigan/g_00205000", device='cuda'):
@@ -185,10 +202,18 @@ class MyWhisper2Normal(object):
         self.model_config = yaml.load(open(args.model_config, "r"), Loader=yaml.FullLoader)
         self.configs = (self.preprocess_config, self.model_config)
         
+        # Input level. An encoder trained on loudness-normalized audio records the level in its
+        # checkpoint, and its input (e.g. the microphone) is normalized the same way. WESPER's
+        # original encoder records none, so its input is passed through unchanged.
+        self.target_dbfs, self.max_gain_db = None, None
         if load_encoder:
             print("#### loading HuBERT")
-            self.encoder = load_hubert(args.hubert, device=device) # device 
+            self.encoder = load_hubert(args.hubert, device=device) # device
             print("### HuBERT model", type(self.encoder))
+            self.target_dbfs = self.encoder.training_config.get("TARGET_DBFS")
+            self.max_gain_db = self.encoder.training_config.get("MAX_GAIN_DB", 40.0)
+            if self.target_dbfs is not None:
+                print(f"### normalizing input to {self.target_dbfs} dBFS speech level, as the encoder was trained")
         
         # FastSpeech2 HiFi-GAN
         if load_decoder:
@@ -212,6 +237,8 @@ class MyWhisper2Normal(object):
 
 
     def whisper2normal(self, wav_from):
+        if self.target_dbfs is not None:
+            wav_from = normalize_level(wav_from, self.target_dbfs, self.max_gain_db)
         if type(wav_from) != torch.Tensor:
             #wav_t = torch.tensor([wav_from], dtype=torch.float32).to(self.device)  # [1, LEN]
             wav_t = torch.tensor(wav_from, dtype=torch.float32).unsqueeze(0).to(self.device)  # [1, LEN]

@@ -7,6 +7,7 @@ import os
 import pyaudio
 import numpy as np
 import tkinter as tk
+from tkinter import ttk
 import time
 import zmq
 import soundfile as sf
@@ -186,6 +187,20 @@ class MicrophoneSD(object):
         print("#### audio", type(audio), audio.shape, type(audio[0]), len(audio), audio.max(), audio.min())
         return audio
 
+def device_choices(kind):
+    """ (index, label) of the audio devices that can record (kind="input") or play (kind="output") """
+    channels = "max_input_channels" if kind == "input" else "max_output_channels"
+    return [(i, f"{i}: {d['name']}") for i, d in enumerate(sd.query_devices()) if d[channels] > 0]
+
+def select_device(kind, index):
+    """ Make device `index` the default input or output, used for all recording and playback.
+        Raises, leaving the defaults alone, if the device can't do 16 kHz mono. """
+    check = sd.check_input_settings if kind == "input" else sd.check_output_settings
+    check(device=index, samplerate=RATE, channels=1)
+    devices = list(sd.default.device)
+    devices[0 if kind == "input" else 1] = index
+    sd.default.device = devices
+
 import tkinter.font
 class MyGUI(tk.Frame):
     def __init__(self, *args, **kwargs):
@@ -197,6 +212,7 @@ class MyGUI(tk.Frame):
         self.text.configure(yscrollcommand=self.vsb.set)
 
         self.button.pack(side="top")
+        self.make_device_selectors().pack(side="top", fill="x", padx=10, pady=10)
         self.vsb.pack(side="right", fill="y")
         self.text.pack(side="bottom", fill="x")
 
@@ -209,9 +225,42 @@ class MyGUI(tk.Frame):
         self.mic = MicrophoneSD() # SD Sound Device version
         #self.mic = MicrophonePA() # PA PyAudio verison 
     
+    def make_device_selectors(self):
+        """ Microphone and output dropdowns. Devices plugged in later need a restart to show up. """
+        frame = tk.Frame(self)
+        frame.columnconfigure(1, weight=1)
+        self.device_boxes = {}
+        for row, (kind, title) in enumerate((("input", "Microphone"), ("output", "Output"))):
+            choices = device_choices(kind)
+            box = ttk.Combobox(frame, state="readonly", values=[label for _, label in choices])
+            self.show_device(box, choices, sd.default.device[row])
+            box.bind("<<ComboboxSelected>>",
+                     lambda event, kind=kind, box=box, choices=choices: self.on_device(kind, box, choices))
+            tk.Label(frame, text=title).grid(row=row, column=0, sticky="w", padx=(0, 10))
+            box.grid(row=row, column=1, sticky="ew", pady=2)
+            self.device_boxes[kind] = (box, choices)
+        return frame
+
+    def show_device(self, box, choices, index):
+        for pos, (i, _) in enumerate(choices):
+            if i == index:
+                box.current(pos)
+
+    def on_device(self, kind, box, choices):
+        index, label = choices[box.current()]
+        try:
+            select_device(kind, index)
+            self.log(f"{kind}: {label}")
+        except Exception as e:
+            self.log(f"can't use {label} for {kind}: {e}")
+            self.show_device(box, choices, sd.default.device[0 if kind == "input" else 1])
+
     def set_client(self, host, args):
         if host == 'direct':
             self.client = MyAudioClientDirect(args)
+            w2n = self.client.w2n
+            level = "unchanged" if w2n.target_dbfs is None else f"normalized to {w2n.target_dbfs} dBFS speech level"
+            self.log(f"encoder: {os.path.basename(args.hubert)}, input {level}")
         else:
             self.client = MyAudioClient(host=host)
 
@@ -221,10 +270,10 @@ class MyGUI(tk.Frame):
         self.log("start")
 
     def on_keypress(self, event):
-        self.log("keypress", event.keycode)
+        self.log(f"keypress {event.keycode}")
 
     def on_keyrelease(self, event):
-        self.log("keyrelease", event.keykode)
+        self.log(f"keyrelease {event.keycode}")
 
     def on_release(self, event):
         self.log("button was released")
@@ -291,8 +340,8 @@ if __name__ == "__main__":
     )
 
 
-    parser.add_argument("--sd", 
-        help="sounddevice",
+    parser.add_argument("--sd",
+        help="input (microphone) device index, from the device list printed at startup; playback stays on the default output",
         type=int,
         default=-1,
     )
@@ -303,8 +352,7 @@ if __name__ == "__main__":
     print("### args", host, args)
 
     if args.sd >= 0:
-        sd.na
-        default.device = args.sd
+        sd.default.device = (args.sd, sd.default.device[1])
 
     devices = sd.query_devices()
     print(devices)
