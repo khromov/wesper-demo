@@ -1,20 +1,25 @@
 """Prepare a single speaker's recordings (e.g. an audiobook) for training a WESPER decoder.
 
-The decoder (FastSpeech2) turns speech units into a mel spectrogram, which WESPER's HiFi-GAN
-vocoder turns into audio. Training it on one speaker gives WESPER that speaker's voice. It
-needs no transcripts, only audio. For every recording this script:
+The decoder (FastSpeech2) turns speech units into a mel spectrogram, which a vocoder turns
+into audio. Training it on one speaker gives WESPER that speaker's voice. It needs no
+transcripts, only audio. The decoder is trained for one vocoder (--vocoder, see vocoders.py):
+hifigan16k, WESPER's own and the default, or bigvgan22k (NVIDIA BigVGAN v2). For every recording
+this script:
 
 1. Decodes it to 16 kHz mono and cuts it into utterances of MIN_SECONDS-MAX_SECONDS at pauses.
 2. Normalizes each utterance to TARGET_DBFS speech level, as WESPER's input is normalized.
-3. Computes, per 20 ms frame:
-   - units: WESPER's original encoder's speech units, the decoder's input. The fine-tuned
-     Swedish encoder was trained to produce these same units from whispers.
-   - mel: the training target, computed exactly as HiFi-GAN computes its training mels, so that
-     WESPER's existing vocoder can play the decoder's output. Its frames line up with the units.
-   - pitch (Hz) and energy, which the decoder learns to predict.
+3. Computes:
+   - units: WESPER's original encoder's speech units (one per 20 ms), the decoder's input. The
+     fine-tuned Swedish encoder was trained to produce these same units from whispers.
+   - mel: the training target, computed as the vocoder computes its own training mels, from the
+     recording decoded at the vocoder's sample rate. For hifigan16k its frames line up one to
+     one with the units; other vocoders have other frame rates, and the units are interpolated
+     to them when training (vocoders.units_to_frames).
+   - pitch (Hz) and energy at each mel frame, which the decoder learns to predict.
 
 Output in OUT_DIR:
-  segments/<id>.npz  units (float16), mel (float16), pitch, energy (float32), all T frames
+  segments/<id>.npz  units (float16, one per 20 ms), mel (float16), pitch, energy (float32):
+                     the last three T mel frames (for hifigan16k, units are T long too)
   audio/<id>.flac    the utterance as cut from the recording, before normalization
   segments.tsv       id, recording, split, start/end seconds, frames, speech level
   stats.json         pitch and energy normalization in FastSpeech2's format
@@ -23,7 +28,7 @@ Output in OUT_DIR:
 The last --val-recordings recordings become the validation split. Recordings that are already
 done are skipped when the script is re-run. The source folder is only read.
 
-usage: python decoder/prepare_data.py AUDIO_DIR OUT_DIR [--val-recordings 3] [--limit N] [--device cpu]
+usage: python decoder/prepare_data.py AUDIO_DIR OUT_DIR [--vocoder hifigan16k] [--val-recordings 3] [--device cpu]
 """
 import argparse
 import csv
@@ -40,11 +45,11 @@ import soundfile as sf
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, REPO)
 from colab.prepare_data import speech_dbfs  # noqa: E402  (the encoder pipeline's level measure)
+import vocoders  # noqa: E402
 
-SR = 16000
-HOP = 320  # 20 ms: one unit, one mel frame
-N_FFT = WIN = 1024
-N_MELS, FMIN, FMAX = 80, 0, 8000  # hifigan/my_config_v1_16000.json
+SR = 16000  # the encoder's sample rate
+HOP = 320  # 20 ms: one unit
+MAX_FRAMES = 1000  # FastSpeech2's max_seq_len (config/my_model16000.yaml): mel frames per utterance
 TARGET_DBFS = -20.0
 MAX_GAIN_DB = 40.0
 MIN_SPEECH_DBFS = -45.0  # quieter recordings are only noise, as in the encoder's data
@@ -56,9 +61,9 @@ ORIGINAL_ENCODER = "https://github.com/rkmt/wesper-demo/releases/download/v0.1/m
 AUDIO_EXTENSIONS = (".mp3", ".wav", ".flac", ".m4a", ".ogg")
 
 
-def decode(path):
-    """Any audio file as 16 kHz mono float32."""
-    pcm = subprocess.run(["ffmpeg", "-nostdin", "-v", "error", "-i", path, "-ac", "1", "-ar", str(SR),
+def decode(path, sample_rate=SR):
+    """Any audio file as mono float32."""
+    pcm = subprocess.run(["ffmpeg", "-nostdin", "-v", "error", "-i", path, "-ac", "1", "-ar", str(sample_rate),
                           "-f", "f32le", "pipe:1"], check=True, capture_output=True, timeout=600).stdout
     return np.frombuffer(pcm, dtype=np.float32).copy()
 
@@ -134,35 +139,16 @@ def normalize(x):
     return (x * 10 ** (gain_db / 20)).astype(np.float32), gain_db
 
 
-_MEL_BASIS = None
+def mel_energy(x, voc=vocoders.HIFIGAN16K):
+    """Log-mel spectrogram and energy as the vocoder's training mels (see vocoders.mel_energy)."""
+    return vocoders.mel_energy(x, voc)
 
 
-def mel_energy(x):
-    """Log-mel spectrogram (N_MELS x T) and energy (T), with T = len(x) // HOP.
+def pitch(x, n_frames, frame_seconds=HOP / SR):
+    """F0 in Hz at each mel frame's center, with unvoiced stretches filled by linear interpolation.
 
-    The same computation as HiFi-GAN's training mels (meldataset.mel_spectrogram): reflect-pad
-    (N_FFT - HOP) / 2, uncentered STFT, magnitude, mel filterbank, natural log clamped at 1e-5.
-    Each frame is centered at sample t * HOP + HOP / 2, like the encoder's units. Energy is the
-    L2 norm of the frame's magnitude spectrum, as in FastSpeech2.
-    """
-    import librosa
-    import torch
-    global _MEL_BASIS
-    if _MEL_BASIS is None:
-        _MEL_BASIS = torch.from_numpy(librosa.filters.mel(sr=SR, n_fft=N_FFT, n_mels=N_MELS, fmin=FMIN, fmax=FMAX)).float()
-    y = torch.from_numpy(np.asarray(x, dtype=np.float32))[None, None]
-    y = torch.nn.functional.pad(y, ((N_FFT - HOP) // 2, (N_FFT - HOP) // 2), mode="reflect")[0, 0]
-    spec = torch.stft(y, N_FFT, HOP, WIN, torch.hann_window(WIN), center=False, return_complex=True)
-    mag = torch.sqrt(spec.real ** 2 + spec.imag ** 2 + 1e-9)
-    mel = torch.log(torch.clamp(_MEL_BASIS @ mag, min=1e-5))
-    return mel.numpy(), torch.linalg.norm(mag, dim=0).numpy()
-
-
-def pitch(x, n_frames):
-    """F0 in Hz at each frame's center, with unvoiced stretches filled by linear interpolation.
-
-    WORLD's DIO + StoneMask, as in FastSpeech2's preprocessing, at 10 ms steps, then sampled at
-    the frame centers t * HOP + HOP / 2. All-unvoiced input gives zeros.
+    WORLD's DIO + StoneMask on 16 kHz audio, as in FastSpeech2's preprocessing, at 10 ms steps,
+    then sampled at the frame centers (t + 0.5) * frame_seconds. All-unvoiced input gives zeros.
     """
     import pyworld
     x = np.asarray(x, dtype=np.float64)
@@ -172,7 +158,7 @@ def pitch(x, n_frames):
     if voiced.sum() < 2:
         return np.zeros(n_frames, dtype=np.float32)
     f0 = np.interp(t, t[voiced], f0[voiced])
-    centers = (np.arange(n_frames) * HOP + HOP / 2) / SR
+    centers = (np.arange(n_frames) + 0.5) * frame_seconds
     return np.interp(centers, t, f0).astype(np.float32)
 
 
@@ -222,20 +208,29 @@ def units(encoder, x, device):
         return encoder.units(torch.from_numpy(x)[None, None].to(device))[0].float().cpu().numpy()
 
 
-def prepare_recording(path, out_dir, encoder, device):
+def prepare_recording(path, out_dir, encoder, device, voc=vocoders.HIFIGAN16K):
     """Segment one recording and write its utterances. Returns their manifest rows."""
     name = os.path.splitext(os.path.basename(path))[0]
-    x = decode(path)
+    x = decode(path)  # 16 kHz: cutting, units and pitch
+    xv = x if voc.sample_rate == SR else decode(path, voc.sample_rate)  # the vocoder's rate: mel and energy
+    max_seconds = min(MAX_SECONDS, 0.98 * MAX_FRAMES * voc.frame_seconds)
     rows = []
-    for k, (s, e) in enumerate(segment(x)):
+    for k, (s, e) in enumerate(segment(x, max_s=max_seconds)):
         seg_id = f"{name}_{k:04d}"
         raw = x[s:e]
         wav, gain_db = normalize(raw)
         u = units(encoder, wav, device)
-        mel, energy = mel_energy(wav)
-        n = min(len(u), mel.shape[1])
-        f0 = pitch(wav, n)
-        np.savez(os.path.join(out_dir, "segments", seg_id + ".npz"), units=u[:n].astype(np.float16),
+        if voc.sample_rate == SR:
+            wav_v = wav
+        else:  # the same stretch of the recording, at the vocoder's rate, with the same gain
+            sv, ev = (round(i * voc.sample_rate / SR) for i in (s, e))
+            wav_v = (xv[sv:ev] * 10 ** (gain_db / 20)).astype(np.float32)
+        mel, energy = mel_energy(wav_v, voc)
+        n = min(mel.shape[1], vocoders.n_frames(len(u), voc))
+        if voc.one_frame_per_unit:
+            u = u[:n]
+        f0 = pitch(wav, n, voc.frame_seconds)
+        np.savez(os.path.join(out_dir, "segments", seg_id + ".npz"), units=u.astype(np.float16),
                  mel=mel[:, :n].astype(np.float16), pitch=f0, energy=energy[:n].astype(np.float32))
         sf.write(os.path.join(out_dir, "audio", seg_id + ".flac"), np.clip(raw, -1, 1), SR, subtype="PCM_16")
         rows.append({"id": seg_id, "recording": name, "start": f"{s / SR:.2f}", "end": f"{e / SR:.2f}",
@@ -252,6 +247,7 @@ def main():
     parser.add_argument("out_dir", help="output folder")
     parser.add_argument("--val-recordings", type=int, default=3, help="last N recordings (sorted by name) for validation")
     parser.add_argument("--limit", type=int, help="only use the first N recordings (for quick tests)")
+    parser.add_argument("--vocoder", default=vocoders.DEFAULT, help="hifigan16k, bigvgan22k or bigvgan:<model> (vocoders.py)")
     parser.add_argument("--encoder", default=ORIGINAL_ENCODER, help="encoder that computes the units")
     parser.add_argument("--device", default="cpu", help="cpu, cuda or mps")
     args = parser.parse_args()
@@ -265,6 +261,13 @@ def main():
     val = {os.path.splitext(os.path.basename(p))[0] for p in recordings[-args.val_recordings:]} if args.val_recordings else set()
     recordings = recordings[: args.limit]
 
+    voc = vocoders.spec(args.vocoder)
+    previous = os.path.join(out, "prep.json")
+    if os.path.exists(previous):  # a re-run reuses finished recordings, so they must be for the same vocoder
+        with open(previous) as f:
+            prepared_for = json.load(f).get("vocoder", vocoders.DEFAULT)
+        if prepared_for != voc.name:
+            sys.exit(f"{out} was prepared for {prepared_for}, not {voc.name}: use another OUT_DIR")
     for sub in ("segments", "audio", "done"):
         os.makedirs(os.path.join(out, sub), exist_ok=True)
     encoder, started = None, time.time()
@@ -275,7 +278,7 @@ def main():
             continue
         if encoder is None:  # only when there's work left: a re-run over finished data is quick
             encoder = load_encoder(args.encoder, args.device)
-        rows = prepare_recording(path, out, encoder, args.device)
+        rows = prepare_recording(path, out, encoder, args.device, voc)
         with open(done + ".tmp", "w", newline="") as f:  # rename after writing: a crash can't leave half a list
             writer = csv.DictWriter(f, FIELDS, delimiter="\t", extrasaction="ignore")
             writer.writeheader()
@@ -306,12 +309,13 @@ def main():
     with open(os.path.join(out, "stats.json"), "w") as f:
         json.dump(compute_stats(pitches, energies), f)
     with open(os.path.join(out, "prep.json"), "w") as f:
-        json.dump({"sample_rate": SR, "hop": HOP, "target_dbfs": TARGET_DBFS, "encoder": args.encoder,
+        json.dump({"vocoder": voc.name, "sample_rate": voc.sample_rate, "hop": voc.hop, "n_mels": voc.n_mels,
+                   "unit_sample_rate": SR, "unit_hop": HOP, "target_dbfs": TARGET_DBFS, "encoder": args.encoder,
                    "min_seconds": MIN_SECONDS, "max_seconds": MAX_SECONDS, "mel": "hifigan"}, f, indent=1)
 
     for split in ("train", "val"):
         part = [r for r in rows if r["split"] == split]
-        hours = sum(int(r["frames"]) for r in part) * HOP / SR / 3600
+        hours = sum(int(r["frames"]) for r in part) * voc.frame_seconds / 3600
         print(f"{split}: {len(part)} utterances, {hours:.2f} h, from {len({r['recording'] for r in part})} recordings")
 
 

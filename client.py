@@ -43,11 +43,12 @@ class MyAudioClient(object):
         self.socket.send_pyobj(audio)
         res = self.socket.recv_pyobj()  # [id, is_whisper, is_normal, rmx, trans_list]
         process_time = (time.time() - start_time)
-        sec = (len(res[0]) / 16000) 
+        sr = res[1] if len(res) > 1 else 16000  # servers send the vocoder's sample rate; older ones don't
+        sec = (len(res[0]) / sr) 
         assert res is not None
         print("### RES", len(res), len(res[0]), sec, process_time, sec / process_time)
         # test playback
-        sf.write("res.wav", res[0], 16000)
+        sf.write("res.wav", res[0], sr)
         subprocess.run(["afplay","res.wav"])
 
         '''

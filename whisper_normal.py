@@ -28,6 +28,8 @@ from libs.hubert.model import Hubert, URLS, HubertSoft
 import hifigan
 # The speech-level measure the fine-tuned encoders' training data was normalized with
 from colab.prepare_data import speech_dbfs
+# The vocoders a decoder can be trained for (HiFi-GAN 16 kHz, BigVGAN)
+import vocoders
 
 
 def load_fastspeech2(configs, checkpoint_path=None, device='cuda'):
@@ -47,10 +49,10 @@ def load_fastspeech2(configs, checkpoint_path=None, device='cuda'):
     model.requires_grad_ = False
     return model
 
-def units2wav(units, fs2model, vocoder, model_config, preprocess_config, device='cuda', d_targets=None, p_targets=None, e_targets=None):
+def units2wav(units, fs2model, vocoder, model_config, preprocess_config, device='cuda', d_targets=None, p_targets=None, e_targets=None, vocoder_spec=None):
     ''' units: [N, D=256] 
         fs2model: Unit-FastSpeech2
-        vocoder: HiFi-GAN
+        vocoder: HiFi-GAN, or the vocoder described by vocoder_spec (vocoders.py)
     '''
     print("### units2wav", "pitch", p_targets) 
     if type(units) == torch.Tensor:
@@ -58,6 +60,9 @@ def units2wav(units, fs2model, vocoder, model_config, preprocess_config, device=
             units = units.squeeze(0)
         units = units.detach().cpu().numpy()
         assert len(units.shape) == 2
+    if vocoder_spec is not None and not vocoder_spec.one_frame_per_unit:
+        # The decoder works at the vocoder's frame rate: units interpolated to its frames, as in training.
+        units = vocoders.units_to_frames(units, vocoders.n_frames(len(units), vocoder_spec), vocoder_spec)
     units = pad_2D([units])
     #units = torch.from_numpy(units).long().to(device)
     units = torch.from_numpy(units).to(device)
@@ -83,6 +88,10 @@ def units2wav(units, fs2model, vocoder, model_config, preprocess_config, device=
     mel_len = output[9][0].item() # mel_lens
     mel_prediction = output[1][0, :mel_len].detach().transpose(0, 1) # postnet_output
     
+    if vocoder_spec is not None and vocoder_spec.name != "hifigan16k":
+        # 16-bit like vocoder_infer's output, but clipped instead of wrapping around.
+        wav = vocoders.synthesize(vocoder, mel_prediction)
+        return (np.clip(wav, -1, 1) * 32767).astype("int16"), output
     with torch.no_grad(): # predict Wavs from MELs
         wav_prediction = vocoder_infer(
             mel_prediction.unsqueeze(0),
@@ -220,9 +229,17 @@ class MyWhisper2Normal(object):
             print("#### loading FastSpeech2")
             self.fs2model = load_fastspeech2(self.configs, checkpoint_path=args.fastspeech2, device=device) # load FastSpeech2
 
+        # The vocoder the decoder was trained for, named in its preprocess config (decoder/train.py).
+        # Decoders without that entry, like WESPER's released ones, use WESPER's HiFi-GAN.
+        self.vocoder_spec = vocoders.spec(self.preprocess_config.get("vocoder", {}).get("name", vocoders.DEFAULT))
+        self.sample_rate = self.vocoder_spec.sample_rate  # of the converted audio
         if load_vocoder:
-            print("### loading HiFI GAN")
-            self.vocoder = load_hifigan(self.model_config, checkpoint_path=args.hifigan, device=device).eval()
+            if self.vocoder_spec.name == "hifigan16k":
+                print("### loading HiFI GAN")
+                self.vocoder = load_hifigan(self.model_config, checkpoint_path=args.hifigan, device=device).eval()
+            else:
+                print("### loading", self.vocoder_spec.name)
+                self.vocoder = vocoders.load(self.vocoder_spec, device)
         print("#### Done.")
 
     def test(self, wavfile='sample_whisper.wav', outfile='/tmp/out.wav'):
@@ -231,7 +248,7 @@ class MyWhisper2Normal(object):
         wav_to, mel = self.convert(wav)
         print("### test:converted", type(wav_to), wav_to.shape)
         #wav_to = torch.tensor(wav_to).unsqueeze(0)
-        sf.write(outfile, wav_to, 16000)
+        sf.write(outfile, wav_to, self.sample_rate)
         print("### test saved to ", outfile)
         return wav_to, mel
 
@@ -246,7 +263,7 @@ class MyWhisper2Normal(object):
             wav_t = wav_from.to(self.device)
         #print("#w2normal WAV", self.device, type(wav_t), wav_t.shape, "maxmin", wav_t.max(), wav_t.min())
         units = wav2units(wav_t, self.encoder, device=self.device) # self.device // cpu
-        wav_to, _ = units2wav(units, self.fs2model, self.vocoder, self.model_config, self.preprocess_config, device=self.device)
+        wav_to, _ = units2wav(units, self.fs2model, self.vocoder, self.model_config, self.preprocess_config, device=self.device, vocoder_spec=self.vocoder_spec)
         #print("#w2normal UNITS", units.shape, "WAV_TO", wav_to.dtype, wav_to.shape, wav_to.min(), wav_to.max())
         return wav_to, None
     
@@ -254,7 +271,7 @@ class MyWhisper2Normal(object):
         return wav2units(wav_t, self.encoder, device=self.device)
     
     def units2wav(self, units, p_targets=None, e_targets=None):
-        return units2wav(units, self.fs2model, self.vocoder, self.model_config, self.preprocess_config, p_targets=p_targets, e_targets=e_targets, device=self.device)
+        return units2wav(units, self.fs2model, self.vocoder, self.model_config, self.preprocess_config, p_targets=p_targets, e_targets=e_targets, device=self.device, vocoder_spec=self.vocoder_spec)
 
     def convert(self, wav_from):
         wav_to, mel = self.whisper2normal(wav_from)

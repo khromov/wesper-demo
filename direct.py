@@ -65,13 +65,13 @@ class MyAudioClientDirect(object):
         process_time = (time.time() - start_time)
 
         print("### converted --->", len(audio), len(normal_wav))
-        sec = (len(normal_wav) / RATE) 
+        sec = (len(normal_wav) / self.w2n.sample_rate)  # the vocoder's rate: 16 kHz for HiFi-GAN
         print("### RES", sec, "process_time", process_time, "x", sec / process_time)
 
         #self.speaker.play(normal_wav)
 
         # test playback
-        sd.play(normal_wav, self.sr)
+        sd.play(normal_wav, self.w2n.sample_rate)
         sd.wait()
 
         '''

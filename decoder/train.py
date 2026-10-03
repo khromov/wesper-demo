@@ -7,6 +7,10 @@ energy predicted per frame. It uses the repo's loss (FastSpeech2Loss) and learni
 released Google TTS decoder (--init googletts), which needs far fewer steps than starting from
 scratch (--init none). The new speaker's pitch and energy statistics replace the old ones.
 
+The decoder is trained for the vocoder its data was prepared for (prepare_data.py --vocoder,
+recorded in DATA_DIR/prep.json; see vocoders.py). The run's preprocess.yaml records it too,
+and WESPER loads that vocoder when it uses the decoder.
+
 RUN_DIR gets:
   decoder_best.pt     the best checkpoint so far (lowest validation mel loss), for WESPER:
                         --fastspeech2 RUN_DIR/decoder_best.pt --preprocess_config RUN_DIR/preprocess.yaml
@@ -14,7 +18,7 @@ RUN_DIR gets:
   stats.json          the speaker's pitch and energy statistics
   latest.pt           everything needed to resume; re-running the same command continues
   history.json        losses
-  samples/            validation utterances: reference/ (the recording), vocoded-target/ (the
+  samples/            validation utterances: reference/ (the recording, 16 kHz), vocoded-target/ (the
                       recording's own mel through the vocoder, the best possible result), and
                       step_NNNNNN/ (the decoder's output from the units, as WESPER produces it)
 
@@ -38,10 +42,11 @@ import yaml
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, REPO)
 sys.path.insert(0, os.path.join(REPO, "libs", "FastSpeech2"))
+import vocoders  # noqa: E402
 
 RELEASE = "https://github.com/rkmt/wesper-demo/releases/download/v0.1"
 INITS = {"googletts": f"{RELEASE}/googletts_neutral_best.tar", "lj": f"{RELEASE}/lambda_best.tar"}
-VOCODER = f"{RELEASE}/g_00205000"
+VOCODER = vocoders.HIFIGAN16K.checkpoint
 BINS = ("variance_adaptor.pitch_bins", "variance_adaptor.energy_bins")  # derived from stats.json, never loaded
 
 
@@ -61,12 +66,18 @@ def fetch(path_or_url):
     return cached
 
 
-def configs(run_dir):
-    """WESPER's configs, with the preprocessing config pointed at run_dir's stats.json."""
+def configs(run_dir, voc=vocoders.HIFIGAN16K):
+    """WESPER's configs, with the preprocessing config pointed at run_dir's stats.json and set
+    up for the vocoder (sample rate, STFT and mel settings, and its name for WESPER)."""
     pre = read_yaml(os.path.join(REPO, "config", "my_preprocess16k_LJ.yaml"))
     pre["dataset"] = os.path.basename(run_dir)
     # Relative to the repo, where WESPER runs from, so the run folder can move between computers.
     pre["path"] = {"preprocessed_path": os.path.relpath(run_dir, REPO)}
+    p = pre["preprocessing"]
+    p["audio"]["sampling_rate"] = voc.sample_rate
+    p["stft"].update(filter_length=voc.n_fft, hop_length=voc.hop, win_length=voc.win)
+    p["mel"].update(n_mel_channels=voc.n_mels, mel_fmin=voc.fmin, mel_fmax=voc.fmax)
+    pre["vocoder"] = {"name": voc.name}
     return pre, read_yaml(os.path.join(REPO, "config", "my_model16000.yaml")), read_yaml(
         os.path.join(REPO, "config", "my_train16k_LJ.yaml"))
 
@@ -78,10 +89,14 @@ def read_segments(data_dir, max_frames):
 
 
 class Utterances(torch.utils.data.Dataset):
-    """Units, mel, normalized pitch and energy of each utterance, all T frames long."""
+    """Units, mel, normalized pitch and energy of each utterance, all T mel frames long.
 
-    def __init__(self, data_dir, rows, stats):
-        self.data_dir, self.rows = data_dir, rows
+    The units are stored one per 20 ms; for vocoders with other frame rates they're interpolated
+    to the mel frames, exactly as WESPER does at inference (vocoders.units_to_frames).
+    """
+
+    def __init__(self, data_dir, rows, stats, voc=vocoders.HIFIGAN16K):
+        self.data_dir, self.rows, self.voc = data_dir, rows, voc
         self.pitch_norm, self.energy_norm = stats["pitch"][2:], stats["energy"][2:]
 
     def __len__(self):
@@ -89,7 +104,8 @@ class Utterances(torch.utils.data.Dataset):
 
     def __getitem__(self, i):
         with np.load(os.path.join(self.data_dir, "segments", self.rows[i]["id"] + ".npz")) as d:
-            return {"id": self.rows[i]["id"], "units": d["units"].astype(np.float32), "mel": d["mel"].T.astype(np.float32),
+            units = vocoders.units_to_frames(d["units"].astype(np.float32), d["mel"].shape[1], self.voc)
+            return {"id": self.rows[i]["id"], "units": units, "mel": d["mel"].T.astype(np.float32),
                     "pitch": ((d["pitch"] - self.pitch_norm[0]) / self.pitch_norm[1]).astype(np.float32),
                     "energy": ((d["energy"] - self.energy_norm[0]) / self.energy_norm[1]).astype(np.float32)}
 
@@ -161,11 +177,12 @@ def main():
     import utils.tools
     import model.modules
     from model import FastSpeech2, FastSpeech2Loss, ScheduledOptim
-    from whisper_normal import load_hifigan
     utils.tools.device = model.modules.device = device  # module-level globals in WESPER's FastSpeech2
 
+    with open(os.path.join(data_dir, "prep.json")) as f:
+        voc = vocoders.spec(json.load(f).get("vocoder", vocoders.DEFAULT))
     shutil.copy(os.path.join(data_dir, "stats.json"), os.path.join(run_dir, "stats.json"))
-    pre, model_config, train_config = configs(run_dir)
+    pre, model_config, train_config = configs(run_dir, voc)
     with open(os.path.join(run_dir, "preprocess.yaml"), "w") as f:
         yaml.safe_dump(pre, f, sort_keys=False)
     with open(os.path.join(run_dir, "stats.json")) as f:
@@ -175,8 +192,8 @@ def main():
     torch.manual_seed(args.seed)
     rows = read_segments(data_dir, model_config["max_seq_len"])
     train_rows, val_rows = [r for r in rows if r["split"] == "train"], [r for r in rows if r["split"] == "val"]
-    print(f"train: {len(train_rows)} utterances, val: {len(val_rows)}, device: {device}", flush=True)
-    train_set, val_set = Utterances(data_dir, train_rows, stats), Utterances(data_dir, val_rows, stats)
+    print(f"train: {len(train_rows)} utterances, val: {len(val_rows)}, vocoder: {voc.name}, device: {device}", flush=True)
+    train_set, val_set = Utterances(data_dir, train_rows, stats, voc), Utterances(data_dir, val_rows, stats, voc)
 
     net = FastSpeech2(pre, model_config).to(device)
     loss_fn = FastSpeech2Loss(pre, model_config).to(device)
@@ -190,9 +207,13 @@ def main():
         step, best, history = 0, math.inf, {"train": [], "val": []}
         if args.init != "none":
             init = torch.load(fetch(INITS.get(args.init, args.init)), map_location="cpu", weights_only=False)["model"]
-            missing, unexpected = net.load_state_dict({k: v for k, v in init.items() if k not in BINS}, strict=False)
-            assert set(missing) == set(BINS) and not unexpected, (missing, unexpected)
-            print(f"starting from {args.init}", flush=True)
+            own = net.state_dict()
+            # Layers whose shape differs (the mel output, for a vocoder with other than 80 bands) start fresh.
+            reshaped = {k for k, v in init.items() if k in own and v.shape != own[k].shape}
+            missing, unexpected = net.load_state_dict(
+                {k: v for k, v in init.items() if k not in BINS and k not in reshaped}, strict=False)
+            assert set(missing) == set(BINS) | reshaped and not unexpected, (missing, unexpected)
+            print(f"starting from {args.init}" + (f", except {sorted(reshaped)}" if reshaped else ""), flush=True)
     optimizer = ScheduledOptim(net, train_config, model_config, step)
     if state is not None:
         optimizer.load_state_dict(state["optimizer"])
@@ -205,11 +226,10 @@ def main():
         scaler.load_state_dict(state["scaler"])
     autocast = (lambda: torch.autocast("cuda", dtype=amp)) if amp else (lambda: torch.autocast("cpu", enabled=False))
 
-    vocoder = load_hifigan(model_config, checkpoint_path=VOCODER, device=device)
+    vocoder = vocoders.load(voc, device)
 
     def synthesize(mel):
-        with torch.no_grad():
-            return vocoder(mel.to(device)[None]).squeeze().float().cpu().numpy()
+        return vocoders.synthesize(vocoder, mel)
 
     sample_rows = val_rows[: args.samples]
     if sample_rows and not os.path.exists(os.path.join(run_dir, "samples", "vocoded-target")):
@@ -220,7 +240,7 @@ def main():
             sf.write(os.path.join(run_dir, "samples", "reference", r["id"] + ".wav"),
                      wav * 10 ** (float(r["gain_db"]) / 20), 16000, subtype="FLOAT")
             sf.write(os.path.join(run_dir, "samples", "vocoded-target", r["id"] + ".wav"),
-                     synthesize(torch.from_numpy(item["mel"]).T), 16000, subtype="FLOAT")
+                     synthesize(torch.from_numpy(item["mel"]).T), voc.sample_rate, subtype="FLOAT")
 
     def evaluate():
         net.eval()
@@ -239,7 +259,7 @@ def main():
                 u = torch.from_numpy(val_set[i]["units"])[None].to(device)
                 # As WESPER runs it: units only, durations and pitch predicted.
                 out = net(torch.zeros(1, dtype=torch.long, device=device), u, torch.tensor([u.shape[1]], device=device), u.shape[1])
-                sf.write(os.path.join(folder, r["id"] + ".wav"), synthesize(out[1][0].float().T), 16000, subtype="FLOAT")
+                sf.write(os.path.join(folder, r["id"] + ".wav"), synthesize(out[1][0].float().T), voc.sample_rate, subtype="FLOAT")
         net.train()
         return dict(zip(["total", "mel", "postnet_mel", "pitch", "energy", "duration"], (totals / max(n, 1)).tolist()))
 

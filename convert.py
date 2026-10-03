@@ -17,7 +17,7 @@ def main(args):
     print("Loaed wav", args.input,  "len", len(whisp_wav))
     normal_wav, _ = w2n.convert(whisp_wav)
     print("Converted wav", args.output,  "len", len(normal_wav))
-    sf.write(args.output, normal_wav, 16000)
+    sf.write(args.output, normal_wav, w2n.sample_rate)  # the vocoder's rate: 16 kHz for HiFi-GAN
           
 
 import argparse

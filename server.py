@@ -47,7 +47,7 @@ class ZmqLoop(object):
                 normal_wav, _ = self.w2n.convert(whisp_wav)
                 print(f"### converted data:{len(data)} whisp_wav:{len(whisp_wav)} normal_wav:{len(normal_wav)}")
 
-            self.socket.send_pyobj((normal_wav,))
+            self.socket.send_pyobj((normal_wav, self.w2n.sample_rate))  # audio and its sample rate
 
     def destroy(self):
         self.socket.close()

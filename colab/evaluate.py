@@ -13,6 +13,11 @@ Two stages, because they need different Python environments.
      whisper-ft    the whisper through the fine-tuned encoder
      normal-ft     normal speech through the fine-tuned encoder
 
+   Conversions use WESPER's English decoder, or with --decoder RUN_DIR a decoder trained by
+   decoder/train.py, with whichever vocoder it was trained for (HiFi-GAN or BigVGAN), at that
+   vocoder's sample rate. To compare decoders or vocoders, run convert once per RUN_DIR into
+   separate OUT_DIRs.
+
 2. asr (a venv with transformers). It transcribes every condition with a Swedish speech
    recognizer (KB-Whisper) and reports character and word error rates against the sentences,
    plus a paired comparison of whisper-ft against whisper-orig.
@@ -22,7 +27,7 @@ The notebook validates on the first VAL_CLIPS of them (default 200), so --skip d
 All val speakers are outside the training set.
 
 usage:
-  .venv/bin/python colab/evaluate.py convert DATA_DIR ENCODER OUT_DIR [--skip 200] [--limit N]
+  .venv/bin/python colab/evaluate.py convert DATA_DIR ENCODER OUT_DIR [--decoder RUN_DIR] [--skip 200] [--limit N]
   colab/.venv-eval/bin/python colab/evaluate.py asr OUT_DIR [--model KBLab/kb-whisper-small]
 
 DATA_DIR is prepare_data.py's --export-dir (manifest.tsv, prep.json, normal/, whisper/).
@@ -78,9 +83,13 @@ def convert(args):
     if not rows:
         sys.exit("no held-out clips: check --skip against the number of val clips")
 
+    if args.decoder:  # a decoder from decoder/train.py; its preprocess.yaml names its vocoder
+        decoder = (os.path.join(args.decoder, "decoder_best.pt"), os.path.join(args.decoder, "preprocess.yaml"))
+    else:
+        decoder = (f"{RELEASE}/googletts_neutral_best.tar", "config/my_preprocess16k_LJ.yaml")
     w2n = wn.MyWhisper2Normal(argparse.Namespace(
-        preprocess_config="config/my_preprocess16k_LJ.yaml", model_config="config/my_model16000.yaml",
-        device="cpu", hubert=None, fastspeech2=f"{RELEASE}/googletts_neutral_best.tar",
+        preprocess_config=decoder[1], model_config="config/my_model16000.yaml",
+        device="cpu", hubert=None, fastspeech2=decoder[0],
         hifigan=f"{RELEASE}/g_00205000"), load_encoder=False)
     encoders = {"orig": wn.load_hubert(ORIGINAL_ENCODER, device="cpu"),
                 "ft": wn.load_hubert(args.encoder, device="cpu")}
@@ -106,7 +115,7 @@ def convert(args):
         for kind, enc in (("normal", "orig"), ("whisper", "orig"), ("whisper", "ft"), ("normal", "ft")):
             w2n.encoder = encoders[enc]
             out, _ = w2n.convert(audio[kind])
-            sf.write(os.path.join(args.out, f"{kind}-{enc}", r["clip"] + ".wav"), out, SR, subtype="PCM_16")
+            sf.write(os.path.join(args.out, f"{kind}-{enc}", r["clip"] + ".wav"), out, w2n.sample_rate, subtype="PCM_16")
         if i % 25 == 0 or i == len(rows):
             print(f"{i}/{len(rows)} clips, {time.time() - started:.0f} s", flush=True)
 
@@ -179,6 +188,17 @@ def kb_whisper(model_id):
     return transcribe
 
 
+def read_16k(path):
+    """Audio at the recognizer's 16 kHz, resampling conversions from vocoders with other rates."""
+    x, sr = sf.read(path, dtype="float32")
+    if sr == SR:
+        return x
+    from math import gcd
+    from scipy.signal import resample_poly
+    g = gcd(SR, sr)
+    return resample_poly(x, SR // g, sr // g).astype(np.float32)
+
+
 def transcribe_condition(out_dir, cond, refs, transcribe, chunk=64):
     """Transcripts for one condition, cached in asr-cache/<cond>.tsv so a rerun skips finished ones."""
     cache = os.path.join(out_dir, "asr-cache", cond + ".tsv")
@@ -188,7 +208,7 @@ def transcribe_condition(out_dir, cond, refs, transcribe, chunk=64):
             return [cached[r["clip"]] for r in refs]
     hyps, started = [], time.time()
     for i in range(0, len(refs), chunk):
-        waves = [sf.read(os.path.join(out_dir, cond, r["clip"] + ".wav"), dtype="float32")[0] for r in refs[i:i + chunk]]
+        waves = [read_16k(os.path.join(out_dir, cond, r["clip"] + ".wav")) for r in refs[i:i + chunk]]
         hyps += [" ".join(h.split()) for h in transcribe(waves)]
         print(f"  {cond}: {len(hyps)}/{len(refs)} clips, {time.time() - started:.0f} s", flush=True)
     os.makedirs(os.path.dirname(cache), exist_ok=True)
@@ -236,6 +256,7 @@ def main():
     p.add_argument("data", help="prepare_data.py export folder")
     p.add_argument("encoder", help="fine-tuned encoder, e.g. encoder_best.pt")
     p.add_argument("out", help="output folder")
+    p.add_argument("--decoder", help="a decoder/train.py run folder (default: WESPER's English decoder)")
     p.add_argument("--skip", type=int, default=200, help="val clips the training run used for model selection")
     p.add_argument("--limit", type=int, help="only evaluate this many clips")
     p = sub.add_parser("asr", help="transcribe the conversions and score them")
@@ -245,6 +266,7 @@ def main():
 
     if args.stage == "convert":
         args.data, args.encoder, args.out = (os.path.realpath(p) for p in (args.data, args.encoder, args.out))
+        args.decoder = os.path.realpath(args.decoder) if args.decoder else None
         convert(args)
     else:
         print(run_asr(os.path.realpath(args.out), kb_whisper(args.model)))

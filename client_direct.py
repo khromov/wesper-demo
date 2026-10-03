@@ -49,11 +49,12 @@ class MyAudioClient(object):
         self.socket.send_pyobj(audio)
         res = self.socket.recv_pyobj()  # [id, is_whisper, is_normal, rmx, trans_list]
         process_time = (time.time() - start_time)
-        sec = (len(res[0]) / self.sr) 
+        sr = res[1] if len(res) > 1 else self.sr  # servers send the vocoder's sample rate; older ones don't
+        sec = (len(res[0]) / sr) 
         assert res is not None
         print("### RES", len(res), len(res[0]), sec, process_time, sec / process_time)
         # test playback
-        sd.play(res[0], self.sr)
+        sd.play(res[0], sr)
         sd.wait()
 
         '''
@@ -261,7 +262,7 @@ class MyGUI(tk.Frame):
             w2n = self.client.w2n
             level = "unchanged" if w2n.target_dbfs is None else f"normalized to {w2n.target_dbfs} dBFS speech level"
             self.log(f"encoder: {os.path.basename(args.hubert)}, input {level}")
-            self.log(f"decoder: {os.path.basename(args.fastspeech2)}")
+            self.log(f"decoder: {os.path.basename(args.fastspeech2)}, vocoder: {w2n.vocoder_spec.name} ({w2n.sample_rate} Hz)")
         else:
             self.client = MyAudioClient(host=host)
 
