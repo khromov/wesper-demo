@@ -108,6 +108,15 @@ class Gui(DeviceSelection):
         self.assertIn("can't use 1: Interface for output", self.log_text())
 
 
+class EmptyRecording(unittest.TestCase):
+    def test_a_release_before_any_audio_gives_none(self):
+        mic = cd.MicrophoneSD()
+        mic.recording, mic.thread = True, mock.Mock()
+        cd.q = __import__("queue").Queue()  # nothing arrived from the microphone
+        self.assertIsNone(mic.stop_recording())
+        self.assertFalse(mic.recording)
+
+
 def make_runs(root):
     """A decoder/runs folder: runs for each vocoder, one without a decoder, and a stray file."""
     runs = os.path.join(root, "runs")
@@ -242,6 +251,14 @@ class VoiceGui(DeviceSelection):
         self.assertIn("still loading", self.log_text())
         release.set()
         self.choose(self.gui.voice_box.get())
+
+    def test_an_empty_recording_is_reported(self):
+        self.gui.mic = mock.Mock(recording=True)
+        self.gui.mic.stop_recording.return_value = None
+        self.gui.client = mock.Mock()
+        self.gui.on_release(None)
+        self.gui.client.call.assert_not_called()
+        self.assertIn("no audio: hold the button while you whisper", self.log_text())
 
     def test_a_voice_that_fails_to_load_is_reported_and_dropdown_resets(self):
         self.gui.make_voice_selector(self.args)

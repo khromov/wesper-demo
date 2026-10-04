@@ -413,7 +413,9 @@ def main(argv=None):
             log(f"### decoder {did}: {source[0]} + {voc.name}")
             fs2 = wn.load_fastspeech2(cfg, checkpoint_path=checkpoint, device="cpu")
             info, checks = export_decoder(fs2, vocoder_for(voc, voc_checkpoint), did, out, units_for_decoder, log, voc)
-            manifest["decoders"].append({"id": did, "label": DECODERS[did][0], "description": DECODERS[did][1],
+            description = DECODERS[did][1] + (". Its BigVGAN is fine-tuned on this decoder's own output, which reduces"
+                                              " its electric buzz (decoder/finetune_vocoder.py)" if voc_checkpoint else "")
+            manifest["decoders"].append({"id": did, "label": DECODERS[did][0], "description": description,
                                          "vocoder": voc.name, "sampleRate": voc.sample_rate, "hop": voc.hop,
                                          "source": source, "file": info, "checks": checks})
             del fs2

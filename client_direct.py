@@ -182,7 +182,7 @@ class MicrophoneSD(object):
         self.thread = None
         self.recording = False
         print("stop recording", len(data))
-        if len(data) < 0:
+        if len(data) == 0:  # released before the microphone delivered anything
             print("### empty audio")
             return None
         data = np.concatenate(data)
@@ -385,6 +385,8 @@ class MyGUI(tk.Frame):
             return
         self.log("button was released")
         audio = self.mic.stop_recording()
+        if audio is None:
+            self.log("no audio: hold the button while you whisper")
         if audio is not None:
             print(len(audio), audio.dtype, max(audio), min(audio))
             self.log("client-call")
