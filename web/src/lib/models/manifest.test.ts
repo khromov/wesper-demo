@@ -1,12 +1,12 @@
 import { describe, expect, test } from "bun:test";
-import { defaultEncoder, fileUrl, parseManifest, type Manifest } from "./manifest";
+import { defaultDecoder, defaultEncoder, fileUrl, parseManifest, type Manifest } from "./manifest";
 
 const file = (path: string) => ({ path, bytes: 100, sha256: "ab".repeat(32) });
 const entry = (id: string) => ({ id, label: id, description: "", file: file(`${id}.onnx`) });
 const manifest = (): Manifest => ({
   version: 2, sampleRate: 16000, hop: 320, maxSeconds: 120,
   encoders: [{ ...entry("sv"), targetDbfs: -20, maxGainDb: 40 }, { ...entry("original"), targetDbfs: null, maxGainDb: null }],
-  decoders: [entry("googletts")],
+  decoders: [entry("sv-narrator"), entry("googletts")],
 });
 
 describe("parseManifest", () => {
@@ -45,4 +45,13 @@ test("the Swedish encoder is the default when present", () => {
   expect(defaultEncoder(m)).toBe("sv");
   m.encoders = m.encoders.filter((e) => e.id !== "sv");
   expect(defaultEncoder(m)).toBe("original");
+});
+
+test("the Swedish narrator is the default voice when present", () => {
+  expect(defaultDecoder(manifest())).toBe("sv-narrator");
+  const m = manifest();
+  m.decoders.reverse();
+  expect(defaultDecoder(m)).toBe("sv-narrator");
+  m.decoders = m.decoders.filter((d) => d.id !== "sv-narrator");
+  expect(defaultDecoder(m)).toBe("googletts");
 });

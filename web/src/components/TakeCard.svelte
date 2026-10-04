@@ -57,14 +57,14 @@
       <button class="dl" onclick={() => download(take.samples, `take${take.id}-input.wav`)} aria-label="Download input">⤓</button>
     </li>
     {#each take.outputs as out, i (out.key)}
-      <li class:playing={playing === out.key} data-row="output" data-encoder={out.encoder.id} data-status={out.status}>
-        <button class="play" disabled={!out.samples} onclick={() => out.samples && onplay(out.key, out.samples)} aria-label="Play {out.encoder.label}">
+      <li class:playing={playing === out.key} data-row="output" data-encoder={out.encoder.id} data-decoder={out.decoder.id} data-status={out.status}>
+        <button class="play" disabled={!out.samples} onclick={() => out.samples && onplay(out.key, out.samples)} aria-label="Play {out.encoder.label} encoder, {out.decoder.label} voice">
           {playing === out.key ? "■" : "▶"}
         </button>
         <kbd class:hidden={!latest}>{i + 1}</kbd>
         <div class="what">
           <span>
-            {out.encoder.label}
+            {out.encoder.label} <span class="muted">→</span> {out.decoder.label}
             <span class="chip">{backendName[out.backend]}</span>
           </span>
           <span class="muted small">
@@ -83,7 +83,7 @@
         </div>
         {#if out.samples}
           {@const samples = out.samples}
-          <button class="dl" onclick={() => download(samples, `take${take.id}-${out.encoder.id}-${out.backend}.wav`)} aria-label="Download {out.encoder.label}">⤓</button>
+          <button class="dl" onclick={() => download(samples, `take${take.id}-${out.encoder.id}-${out.decoder.id}-${out.backend}.wav`)} aria-label="Download {out.encoder.label} encoder, {out.decoder.label} voice">⤓</button>
         {/if}
       </li>
     {/each}

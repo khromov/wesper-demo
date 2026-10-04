@@ -1,7 +1,8 @@
 // End-to-end test: runs the app in Google Chrome with a fake microphone that plays
 // sample_whisper.wav, and checks every path a person would use.
-//   - The Swedish encoder and WebGPU are the defaults.
+//   - The Swedish encoder, the Swedish narrator voice and WebGPU are the defaults.
 //   - Push-to-talk works with the mouse and with Space, and converts with both encoders.
+//   - Comparing voices converts with every encoder and voice, and the voices sound different.
 //   - An uploaded file converts too, and "Run again" works after switching to WASM.
 //   - WebGPU and WASM agree, and the two encoders give different results.
 //   - Old downloads are cleaned up, and a private window says it can't keep the models.
@@ -117,6 +118,7 @@ async function waitForServer() {
 
 interface OutputInfo {
   encoder: string;
+  decoder: string;
   backend: string;
   status: string;
   error: string;
@@ -148,7 +150,7 @@ const takes = (page: Page): Promise<TakeInfo[]> =>
           finite &&= Number.isFinite(v);
         }
         return {
-          encoder: o.encoder.id, backend: o.backend, status: o.status, error: o.error,
+          encoder: o.encoder.id, decoder: o.decoder.id, backend: o.backend, status: o.status, error: o.error,
           samples: s?.length ?? 0, rmsDb: s ? 10 * Math.log10(sum / s.length + 1e-12) : -120, finite, ms: o.encodeMs + o.decodeMs,
         };
       }),
@@ -203,9 +205,10 @@ function check(cond: unknown, msg: string) {
   console.log(`  ok  ${msg}`);
 }
 
-function checkTake(t: TakeInfo, backend: string, from = 0) {
+function checkTake(t: TakeInfo, backend: string, from = 0, pairs = ["sv:sv-narrator", "original:sv-narrator"]) {
   const outs = t.outputs.slice(from);
-  check(outs.map((o) => o.encoder).join() === "sv,original", `take ${t.id}: converted with sv, then original (${outs.map((o) => o.encoder)})`);
+  const got = outs.map((o) => `${o.encoder}:${o.decoder}`);
+  check(got.join() === pairs.join(), `take ${t.id}: converted as ${pairs.join(", then ")} (${got})`);
   for (const o of outs) {
     check(o.status === "done", `take ${t.id} ${o.encoder}: done${o.error ? ` (${o.error})` : ""}`);
     check(o.backend === backend, `take ${t.id} ${o.encoder}: ran on ${o.backend}`);
@@ -243,9 +246,11 @@ try {
   await waitForReady(page);
   const state = await page.evaluate(() => {
     const app = (window as any).__wesper;
-    return { encoder: app.settings.encoder, compare: app.settings.compare, ...app.resolved, isolated: crossOriginIsolated, threads: app.caps.threads };
+    return { encoder: app.settings.encoder, decoder: app.settings.decoder, compare: app.settings.compare,
+             compareVoices: app.settings.compareVoices, ...app.resolved, isolated: crossOriginIsolated, threads: app.caps.threads };
   });
   check(state.encoder === "sv" && state.compare, `Swedish encoder selected, compare on`);
+  check(state.decoder === "sv-narrator" && !state.compareVoices, `Swedish narrator voice selected, voice compare off`);
   check(state.backend === "webgpu", `WebGPU by default (${state.backend})`);
   check(state.isolated && state.threads > 1, `cross-origin isolated, ${state.threads} WASM threads`);
 
@@ -304,6 +309,17 @@ try {
     null, { timeout: 30_000, polling: 200 },
   );
   check((await cached()).sort().join() === before.sort().join(), "a download no longer in models.json is deleted, the models stay");
+
+  console.log("comparing voices");
+  await page.getByLabel(/Also convert with the .* voice/).check();
+  await waitForReady(page);
+  await page.getByTestId("file").setInputFiles(SAMPLE); // the reload above cleared the takes: a new one
+  await page.waitForFunction(() => (window as any).__wesper.takes.length > 0, null, { timeout: STEP_MS });
+  const voiceTake: number = await page.evaluate(() => (window as any).__wesper.takes[0].id);
+  t = await waitForOutputs(page, voiceTake, 4);
+  checkTake(t, "wasm", 0, ["sv:sv-narrator", "sv:googletts", "original:sv-narrator", "original:googletts"]);
+  const voices = await snr(page, voiceTake, 0, 1);
+  check(voices < 20, `the two voices give different audio (${voices.toFixed(1)} dB SNR)`);
 
   check(consoleErrors.length === 0, `no console errors${consoleErrors.length ? `: ${consoleErrors.join(" | ")}` : ""}`);
 

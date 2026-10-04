@@ -6,7 +6,7 @@ import { resolve, type BackendChoice, type Capabilities } from "./engine/backend
 import { Engine } from "./engine/client";
 import type { ModelRef, Phase, Setup } from "./engine/protocol";
 import {
-  defaultEncoder, fileUrl, parseManifest,
+  defaultDecoder, defaultEncoder, fileUrl, parseManifest,
   type Backend, type EncoderEntry, type Manifest, type ModelEntry,
 } from "./models/manifest";
 import { clearDownloads, pruneDownloads, storedBytes } from "./models/download";
@@ -18,15 +18,20 @@ const PREFS_KEY = "wesper-settings";
 
 export interface Settings {
   encoder: string;
+  /** The decoder, i.e. the voice the conversion speaks with. */
+  decoder: string;
   backend: BackendChoice;
   /** Also convert each take with the other encoder(s). */
   compare: boolean;
+  /** Also convert each take with the other voice(s). */
+  compareVoices: boolean;
   microphone: string;
 }
 
 export interface Output {
   key: string;
   encoder: EncoderEntry;
+  decoder: ModelEntry;
   backend: Backend;
   status: "queued" | "running" | "done" | "error";
   /** Gain applied to the input for this encoder, or null if it takes the input as-is. */
@@ -75,7 +80,7 @@ export class App {
   /** The last thing that went wrong, shown until dismissed. */
   error = $state("");
   notice = $state("");
-  settings = $state<Settings>({ encoder: "sv", backend: "auto", compare: true, microphone: "" });
+  settings = $state<Settings>({ encoder: "sv", decoder: "sv-narrator", backend: "auto", compare: true, compareVoices: false, microphone: "" });
   loading = $state<Loading | null>(null);
   ready = $state(false);
   takes = $state<Take[]>([]);
@@ -94,6 +99,14 @@ export class App {
     if (!m || !this.encoder) return [];
     const selected = this.encoder;
     return [selected, ...(this.settings.compare ? m.encoders.filter((e) => e.id !== selected.id) : [])];
+  });
+  decoder = $derived(this.manifest?.decoders.find((d) => d.id === this.settings.decoder) ?? null);
+  /** Voices each take is converted with, the selected one first. */
+  runDecoders = $derived.by(() => {
+    const m = this.manifest;
+    if (!m || !this.decoder) return [];
+    const selected = this.decoder;
+    return [selected, ...(this.settings.compareVoices ? m.decoders.filter((d) => d.id !== selected.id) : [])];
   });
   busy = $derived(this.takes.some((t) => t.outputs.some((o) => o.status === "queued" || o.status === "running")));
 
@@ -129,8 +142,10 @@ export class App {
     const m = this.manifest;
     this.settings = {
       encoder: m.encoders.some((e) => e.id === prefs.encoder) ? prefs.encoder! : defaultEncoder(m),
+      decoder: m.decoders.some((d) => d.id === prefs.decoder) ? prefs.decoder! : defaultDecoder(m),
       backend: (["auto", "webgpu", "wasm"] as const).includes(prefs.backend!) ? prefs.backend! : "auto",
       compare: prefs.compare ?? true,
+      compareVoices: prefs.compareVoices ?? false,
       microphone: prefs.microphone ?? "",
     };
     // Downloads of files no longer in models.json (earlier exports) only take up space.
@@ -156,7 +171,7 @@ export class App {
       // settings just aren't remembered
     }
     if ("microphone" in change) this.recorder?.close();
-    if ("encoder" in change || "backend" in change || "compare" in change) void this.prepare();
+    if (["encoder", "decoder", "backend", "compare", "compareVoices"].some((k) => k in change)) void this.prepare();
   }
 
   private setup(): Setup {
@@ -174,7 +189,7 @@ export class App {
     const run = ++this.prepareRun;
     this.ready = false;
     try {
-      const { notCached } = await this.engine.prepare(this.setup(), this.runEncoders.map(ref), ref(m.decoders[0]), this.onProgress);
+      const { notCached } = await this.engine.prepare(this.setup(), this.runEncoders.map(ref), this.runDecoders.map(ref), this.onProgress);
       if (run === this.prepareRun) this.ready = true;
       if (notCached.length)
         this.notice = `This browser didn't let the page keep ${notCached.join(", ")} (a private window, or low on disk space?), so ${notCached.length > 1 ? "they download" : "it downloads"} again next visit.`;
@@ -280,17 +295,16 @@ export class App {
 
   // ------------------------------------------------------------ conversion
 
-  /** Converts a take with the current settings, adding one output per encoder. Plays the first. */
+  /** Converts a take with the current settings, adding one output per encoder and voice. Plays the first. */
   async convert(take: Take) {
-    const m = this.manifest;
-    if (!m || !this.resolved) return;
+    if (!this.manifest || !this.resolved) return;
     const setup = this.setup();
-    const outputs = this.runEncoders.map((encoder): Output => ({
-      key: `${take.id}:${take.outputs.length}:${encoder.id}`,
-      encoder, backend: setup.backend, status: "queued",
+    const outputs = this.runEncoders.flatMap((encoder) => this.runDecoders.map((decoder): Output => ({
+      key: `${take.id}:${take.outputs.length}:${encoder.id}:${decoder.id}`,
+      encoder, decoder, backend: setup.backend, status: "queued",
       gainDb: encoder.targetDbfs === null ? null : normalizationGainDb(take.samples, encoder.targetDbfs, encoder.maxGainDb!),
       samples: null, encodeMs: 0, decodeMs: 0, error: "",
-    }));
+    })));
     const first = take.outputs.length;
     take.outputs.push(...outputs);
     for (let i = first; i < take.outputs.length; i++) {
@@ -298,7 +312,7 @@ export class App {
       out.status = "running";
       try {
         const input = out.gainDb === null ? take.samples : applyGain(take.samples, out.gainDb);
-        const r = await this.engine.convert(setup, ref(out.encoder), ref(m.decoders[0]), input, this.onProgress);
+        const r = await this.engine.convert(setup, ref(out.encoder), ref(out.decoder), input, this.onProgress);
         this.loading = null;
         Object.assign(out, { samples: r.wav, encodeMs: r.encodeMs, decodeMs: r.decodeMs, status: "done" });
         if (i === first && take === this.takes[0]) this.play(out.key, r.wav);

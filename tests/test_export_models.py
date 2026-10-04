@@ -29,6 +29,7 @@ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CACHE = os.path.join(torch.hub.get_dir(), "checkpoints")
 CACHED = [os.path.join(CACHE, f) for f in ("model-layer12-450000.pt", "googletts_neutral_best.tar", "g_00205000")]
 SV_ENCODER = os.path.join(REPO, "colab", "data", "runs", "n2w-finetune", "encoder_best.pt")
+SV_DECODER = os.path.join(REPO, "decoder", "runs", "sv-narrator")  # decoder/train.py run folder
 
 sys.path.insert(0, os.path.join(REPO, "web"))
 import export_models as em  # noqa: E402
@@ -136,6 +137,47 @@ class AgainstCheckpoints(unittest.TestCase):
         torch.testing.assert_close(wav, em.reference_wav(self.fs2, self.vocoder, units), atol=1e-5, rtol=0)
 
 
+class RunConfigs(unittest.TestCase):
+    def test_refuses_decoders_for_other_vocoders(self):
+        with tempfile.TemporaryDirectory() as run:
+            with open(os.path.join(run, "preprocess.yaml"), "w") as f:
+                f.write("path: {preprocessed_path: x}\nvocoder: {name: bigvgan22k}\n")
+            with self.assertRaises(SystemExit) as e:
+                em.load_run_configs(run, {})
+            self.assertIn("HiFi-GAN", str(e.exception))
+
+    def test_finds_stats_in_the_run_folder_wherever_it_is(self):
+        with tempfile.TemporaryDirectory() as run:
+            with open(os.path.join(run, "preprocess.yaml"), "w") as f:
+                f.write("path: {preprocessed_path: decoder/runs/elsewhere}\n")
+            pre, model = em.load_run_configs(run, {"m": 1})
+            self.assertEqual((pre["path"]["preprocessed_path"], model), (run, {"m": 1}))
+
+
+@unittest.skipUnless(all(os.path.exists(p) for p in CACHED), "WESPER's checkpoints aren't cached yet")
+@unittest.skipUnless(os.path.exists(os.path.join(SV_DECODER, "decoder_best.pt")), "no Swedish decoder run in decoder/runs/sv-narrator")
+class NarratorDecoder(unittest.TestCase):
+    """The Swedish narrator decoder from decoder/train.py, exported the same way as googletts."""
+
+    @classmethod
+    def setUpClass(cls):
+        hubert = em.wn.load_hubert(CACHED[0], device="cpu")
+        configs = em.load_run_configs(os.path.abspath(SV_DECODER), em.load_configs()[1])
+        cls.fs2 = em.wn.load_fastspeech2(configs, checkpoint_path=os.path.join(SV_DECODER, "decoder_best.pt"), device="cpu")
+        cls.vocoder = em.wn.load_hifigan(configs[1], checkpoint_path=CACHED[2], device="cpu")
+        wav, _ = sf.read(os.path.join(REPO, "sample_whisper.wav"), dtype="float32")
+        cls.units = em.reference_units(hubert, wav)
+
+    def test_decoder_wrapper_matches_reference(self):
+        wav = em.DecoderExport(self.fs2, self.vocoder).eval()(self.units)[0]
+        torch.testing.assert_close(wav, em.reference_wav(self.fs2, self.vocoder, self.units), atol=1e-5, rtol=0)
+
+    def test_one_frame_per_unit(self):
+        # The trained duration predictor must keep durations at 1, as the app's e2e test expects.
+        ref = em.reference_wav(self.fs2, self.vocoder, self.units)
+        self.assertEqual(len(ref), self.units.shape[1] * em.HOP + 8)
+
+
 @unittest.skipUnless(os.environ.get("WESPER_EXPORT_SMOKE"), "set WESPER_EXPORT_SMOKE=1 to run the full export")
 @unittest.skipUnless(all(os.path.exists(p) for p in CACHED), "WESPER's checkpoints aren't cached yet")
 class ExportSmoke(unittest.TestCase):
@@ -156,8 +198,11 @@ class ExportSmoke(unittest.TestCase):
             self.assertEqual((original["targetDbfs"], original["maxGainDb"]), (None, None))
             if has_sv:
                 self.assertEqual((manifest["encoders"][0]["targetDbfs"], manifest["encoders"][0]["maxGainDb"]), (-20.0, 40.0))
+            has_sv_decoder = os.path.exists(os.path.join(SV_DECODER, "decoder_best.pt"))
+            self.assertEqual([d["id"] for d in manifest["decoders"]], ["sv-narrator", "googletts"] if has_sv_decoder else ["googletts"])
             self.assertEqual(sorted(f for f in os.listdir(out) if f.endswith(".onnx")),
-                             sorted([f"encoder-{e['id']}.onnx" for e in manifest["encoders"]] + ["decoder-googletts.onnx"]))
+                             sorted([f"encoder-{e['id']}.onnx" for e in manifest["encoders"]] +
+                                    [f"decoder-{d['id']}.onnx" for d in manifest["decoders"]]))
             for entry in manifest["encoders"] + manifest["decoders"]:
                 info = entry["file"]
                 path = os.path.join(out, info["path"])

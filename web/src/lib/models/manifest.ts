@@ -33,6 +33,8 @@ export interface Manifest {
 
 /** The encoder selected by default: the Swedish one when it was exported. */
 export const DEFAULT_ENCODER = "sv";
+/** The voice (decoder) selected by default: the Swedish narrator when it was exported. */
+export const DEFAULT_DECODER = "sv-narrator";
 
 function fail(msg: string): never {
   throw new Error(`models.json: ${msg}. Re-run .venv/bin/python web/export_models.py`);
@@ -68,4 +70,8 @@ export function fileUrl(base: string, file: ModelFile): string {
 
 export function defaultEncoder(m: Manifest): string {
   return m.encoders.some((e) => e.id === DEFAULT_ENCODER) ? DEFAULT_ENCODER : m.encoders[0].id;
+}
+
+export function defaultDecoder(m: Manifest): string {
+  return m.decoders.some((d) => d.id === DEFAULT_DECODER) ? DEFAULT_DECODER : m.decoders[0].id;
 }

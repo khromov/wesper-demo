@@ -16,6 +16,7 @@
   const mb = (bytes: number) => (bytes >= 1e9 ? `${(bytes / 1e9).toFixed(1)} GB` : `${Math.round(bytes / 1e6)} MB`);
   const backendName = { webgpu: "WebGPU", wasm: "WebAssembly" };
   const others = $derived(app.manifest?.encoders.filter((e) => e.id !== app.settings.encoder).map((e) => e.label) ?? []);
+  const otherVoices = $derived(app.manifest?.decoders.filter((d) => d.id !== app.settings.decoder).map((d) => d.label) ?? []);
 
   const status = $derived.by(() => {
     const l = app.loading;
@@ -85,6 +86,12 @@
           onchange={(encoder) => app.update({ encoder })}
         />
         <Segmented
+          label="Voice"
+          value={app.settings.decoder}
+          options={app.manifest.decoders.map((d) => ({ value: d.id, label: d.label }))}
+          onchange={(decoder) => app.update({ decoder })}
+        />
+        <Segmented
           label="Backend"
           value={app.settings.backend}
           options={[
@@ -101,11 +108,20 @@
           {app.encoder.targetDbfs === null ? "Input goes in at its recorded level." : `Input is normalized to ${app.encoder.targetDbfs} dBFS speech level, as in training.`}
         </p>
       {/if}
+      {#if app.decoder}
+        <p class="small muted desc">Voice: {app.decoder.description}.</p>
+      {/if}
       <div class="row">
         {#if others.length}
           <label class="check">
             <input type="checkbox" checked={app.settings.compare} onchange={(e) => app.update({ compare: e.currentTarget.checked })} />
             Also convert with {others.join(", ")}, to compare
+          </label>
+        {/if}
+        {#if otherVoices.length}
+          <label class="check">
+            <input type="checkbox" checked={app.settings.compareVoices} onchange={(e) => app.update({ compareVoices: e.currentTarget.checked })} />
+            Also convert with the {otherVoices.join(", ")} voice, to compare
           </label>
         {/if}
         <label class="mic small">
@@ -168,7 +184,7 @@
           onremove={() => app.removeTake(take)}
         />
       {:else}
-        <p class="muted center small empty">Your takes appear here. Each one is converted with the encoders above, and the first result plays automatically.</p>
+        <p class="muted center small empty">Your takes appear here. Each one is converted with the encoders and voices above, and the first result plays automatically.</p>
       {/each}
     </section>
   {:else}

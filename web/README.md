@@ -7,6 +7,9 @@ on WebGPU when the browser has it and WebAssembly otherwise. No audio leaves the
 
 - **Encoders:** Swedish (fine-tuned, the default) and the original, side by side. With *Also
   convert with…* on, each take is converted by both, so you can A/B them with keys `1` and `2`.
+- **Voices (decoders):** the Swedish narrator (trained by `decoder/train.py`, the default) and
+  WESPER's English voice. With *Also convert with the … voice* on, each take is also converted
+  with the other voice; it's off by default, since each voice is another 200 MB download.
 - **Backend:** Auto (WebGPU if available), WebGPU, or WASM.
 - **Run again** converts an earlier take with the current settings, e.g. on the other backend.
 - Each result shows its timing and the gain applied to the input. Results can be downloaded as WAV.
@@ -24,11 +27,14 @@ bun install
 bun run dev        # http://localhost:5173
 ```
 
-The export takes the Swedish encoder from `colab/data/runs/n2w-finetune/encoder_best.pt` and
-skips it if that file is missing (`--sv PATH` to use another). The original encoder and the
-googletts decoder are WESPER's release files (downloaded on first use; cached by torch).
+The export takes the Swedish encoder from `colab/data/runs/n2w-finetune/encoder_best.pt` and the
+Swedish narrator voice from the `decoder/runs/sv-narrator/` run folder, and skips either if it's
+missing (`--sv PATH`, `--sv-decoder FOLDER` to use others). The voice must have been trained for
+WESPER's 16 kHz HiFi-GAN; a BigVGAN run is refused. The original encoder and the English googletts
+decoder are WESPER's release files (downloaded on first use; cached by torch).
 
-The models are fp32: 378 MB per encoder and 200 MB for the decoder, so 956 MB with both encoders.
+The models are fp32: 378 MB per encoder and 200 MB per voice, so 956 MB with both encoders and
+one voice, and 1.16 GB with both voices. Only the models the current settings use are downloaded.
 They're cached in the browser (Cache API) after the first download; the footer shows how much is
 stored, with a link to clear it. Private windows don't allow that much storage, so there they
 download on every visit, and the app says so. Files from earlier exports are deleted from the
@@ -41,9 +47,10 @@ cache on load.
 (Actions → *Web demo on GitHub Pages* → *Run workflow*). The models are too big for the repo and
 for Pages, so they live elsewhere:
 
-1. Upload the four files in `web/public/models/` to one public folder (e.g. on S3):
-   `models.json`, `encoder-sv.onnx`, `encoder-original.onnx` and `decoder-googletts.onnx`. After
-   every re-export, upload all four again: `models.json` holds the other files' sizes and hashes.
+1. Upload the five files in `web/public/models/` to one public folder (e.g. on S3):
+   `models.json`, `encoder-sv.onnx`, `encoder-original.onnx`, `decoder-sv-narrator.onnx` and
+   `decoder-googletts.onnx`. After every re-export, upload them all again: `models.json` holds the
+   other files' sizes and hashes.
 2. Allow the site to read them (CORS). On S3:
    ```json
    [{ "AllowedOrigins": ["https://khromov.github.io", "http://localhost:5173"],
@@ -75,7 +82,7 @@ WESPER_EXPORT_SMOKE=1 .venv/bin/python -m unittest tests.test_export_models -v  
 ```
 
 The end-to-end test plays `sample_whisper.wav` as the microphone. It checks push-to-talk with the
-mouse and with Space, file upload, both encoders, WebGPU and WASM (which must agree), that settings
+mouse and with Space, file upload, both encoders, both voices, WebGPU and WASM (which must agree), that settings
 survive a reload, the cache cleanup, and the private-window message. With `--pages`, the build is
 served under `/wesper-demo/` without COOP/COEP headers (as GitHub Pages does), and the models from a
 second origin with CORS (as S3 does); it also checks that the service worker gives WASM its threads.
@@ -109,7 +116,7 @@ normalized to the level it was trained on; the original gets it unchanged, as in
   `bun install` by `scripts/copy-vendor.ts`). Its newer native WebGPU build gave NaN audio from the decoder in Chrome 154.
 - **Models elsewhere:** `VITE_MODELS_URL` loads them from another server, which must send CORS
   headers; the build then leaves out `public/models/`. Without it, `bun run build` copies the
-  models into `dist/` (956 MB).
+  models into `dist/` (1.16 GB).
 
 ### Measured (Chrome 154, Apple M3, 5.8 s whisper)
 

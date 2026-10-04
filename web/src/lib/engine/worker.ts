@@ -105,7 +105,7 @@ async function handle(req: Request) {
       post({ id: req.id, type: "done", result: await capabilities() });
     } else if (req.type === "prepare") {
       await useSetup(req.setup);
-      for (const encoder of req.encoders) await pair(req.setup, encoder, req.decoder, req.id);
+      for (const encoder of req.encoders) for (const decoder of req.decoders) await pair(req.setup, encoder, decoder, req.id);
       post({ id: req.id, type: "done", result: { notCached: [...notCached] } });
     } else {
       await useSetup(req.setup);

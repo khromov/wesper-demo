@@ -39,8 +39,8 @@ export class Engine {
     return this.call({ type: "capabilities" });
   }
 
-  prepare(setup: Setup, encoders: ModelRef[], decoder: ModelRef, onProgress?: Progress): Promise<PrepareResult> {
-    return this.call({ type: "prepare", setup, encoders, decoder }, onProgress);
+  prepare(setup: Setup, encoders: ModelRef[], decoders: ModelRef[], onProgress?: Progress): Promise<PrepareResult> {
+    return this.call({ type: "prepare", setup, encoders, decoders }, onProgress);
   }
 
   /** Converts 16 kHz audio. `wav` is copied, so the caller keeps its array. */

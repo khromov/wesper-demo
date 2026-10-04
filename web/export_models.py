@@ -2,14 +2,15 @@
 
 Writes into web/public/models/ (by default):
   encoder-<id>.onnx         audio [1, T] float32, 16 kHz -> soft units [1, T // 320, 256]
-  decoder-googletts.onnx    soft units -> audio [1, S] float32 (FastSpeech2 + HiFi-GAN)
+  decoder-<id>.onnx         soft units -> audio [1, S] float32 (FastSpeech2 + HiFi-GAN), one per voice
   models.json               what the app loads: labels, files, sizes, hashes and each encoder's input level
 
 The models stay fp32: fp16 versions were tried and sounded clearly worse in the browser.
 
-Encoders: WESPER's original, and the Swedish fine-tuned one if its checkpoint exists. Every
-exported file is checked against the PyTorch code path that convert.py and the GUI use; the
-script fails if they disagree.
+Encoders: WESPER's original, and the Swedish fine-tuned one if its checkpoint exists. Decoders
+(voices): the Swedish narrator trained by decoder/train.py if its run folder exists, and WESPER's
+English googletts one. Every exported file is checked against the PyTorch code path that
+convert.py and the GUI use; the script fails if they disagree.
 
     .venv/bin/python web/export_models.py               # needs: pip install -r web/requirements-export.txt
 
@@ -237,6 +238,23 @@ def export_decoder(fs2, vocoder, did, out, units_list, log):
     return info, checks
 
 
+DECODERS = {  # id -> label, description; the first one found is the app's default
+    "sv-narrator": ("Swedish narrator", "A Swedish voice: WESPER's decoder fine-tuned on 14 h of one audiobook narrator (decoder/), with HiFi-GAN 16 kHz"),
+    "googletts": ("English", "WESPER's English voice trained on Google TTS output, with HiFi-GAN 16 kHz"),
+}
+
+
+def load_run_configs(run, model_config):
+    """(preprocess_config, model_config) of a decoder/train.py run folder, its stats.json found wherever the folder is."""
+    with open(os.path.join(run, "preprocess.yaml")) as f:
+        pre = yaml.load(f, Loader=yaml.FullLoader)
+    pre["path"]["preprocessed_path"] = run
+    vocoder = pre.get("vocoder", {}).get("name", "hifigan16k")
+    if vocoder != "hifigan16k":
+        raise SystemExit(f"{run} was trained for {vocoder}: the web app plays decoders for WESPER's 16 kHz HiFi-GAN only")
+    return pre, model_config
+
+
 ENCODERS = {  # id -> label, description; the first one found is the app's default
     "sv": ("Swedish", "WESPER's encoder fine-tuned on Swedish Normal2Whisper pairs (colab/)"),
     "original": ("Original", "WESPER's original encoder (English: LibriSpeech, pseudo-whispers, wTIMIT)"),
@@ -249,6 +267,8 @@ def main(argv=None):
     p.add_argument("--original", default=f"{RELEASE}/model-layer12-450000.pt", help="original encoder checkpoint")
     p.add_argument("--sv", default=os.path.join(REPO, "colab", "data", "runs", "n2w-finetune", "encoder_best.pt"),
                    help="Swedish encoder checkpoint; skipped if missing, or if set to ''")
+    p.add_argument("--sv-decoder", default=os.path.join(REPO, "decoder", "runs", "sv-narrator"),
+                   help="Swedish decoder run folder (decoder_best.pt, preprocess.yaml, stats.json); skipped if missing, or if set to ''")
     p.add_argument("--fastspeech2", default=f"{RELEASE}/googletts_neutral_best.tar")
     p.add_argument("--hifigan", default=f"{RELEASE}/g_00205000")
     p.add_argument("--timeout", type=float, default=1800, help="seconds before a hung export is aborted")
@@ -289,14 +309,23 @@ def main(argv=None):
         if not manifest["encoders"]:
             raise SystemExit("no encoder checkpoints found")
 
-        log(f"### decoder googletts: {args.fastspeech2} + {args.hifigan}")
         configs = load_configs()
-        fs2 = wn.load_fastspeech2(configs, checkpoint_path=args.fastspeech2, device="cpu")
         vocoder = wn.load_hifigan(configs[1], checkpoint_path=args.hifigan, device="cpu")
-        info, checks = export_decoder(fs2, vocoder, "googletts", out, units_for_decoder, log)
-        manifest["decoders"].append({
-            "id": "googletts", "label": "googletts_neutral", "description": "WESPER's English voice trained on Google TTS output, with HiFi-GAN 16 kHz",
-            "source": [args.fastspeech2, args.hifigan], "file": info, "checks": checks})
+        decoders = []  # (id, configs, checkpoint, source)
+        run = args.sv_decoder and os.path.abspath(args.sv_decoder)
+        if run and os.path.exists(os.path.join(run, "decoder_best.pt")):
+            decoders.append(("sv-narrator", load_run_configs(run, configs[1]), os.path.join(run, "decoder_best.pt"),
+                             [os.path.relpath(os.path.join(run, "decoder_best.pt"), REPO), args.hifigan]))
+        else:
+            log(f"### skipping the {DECODERS['sv-narrator'][0]} decoder: no decoder_best.pt in {args.sv_decoder!r}")
+        decoders.append(("googletts", configs, args.fastspeech2, [args.fastspeech2, args.hifigan]))
+        for did, cfg, checkpoint, source in decoders:
+            log(f"### decoder {did}: {source[0]} + {args.hifigan}")
+            fs2 = wn.load_fastspeech2(cfg, checkpoint_path=checkpoint, device="cpu")
+            info, checks = export_decoder(fs2, vocoder, did, out, units_for_decoder, log)
+            manifest["decoders"].append({"id": did, "label": DECODERS[did][0], "description": DECODERS[did][1],
+                                         "source": source, "file": info, "checks": checks})
+            del fs2
 
         with open(os.path.join(out, "models.json"), "w") as f:
             json.dump(manifest, f, indent=2)

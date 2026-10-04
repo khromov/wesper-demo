@@ -19,7 +19,7 @@ export interface Setup {
 export type Request =
   | { id: number; type: "capabilities" }
   /** Download, initialize and warm up models ahead of use; releases models of other setups. */
-  | { id: number; type: "prepare"; setup: Setup; encoders: ModelRef[]; decoder: ModelRef }
+  | { id: number; type: "prepare"; setup: Setup; encoders: ModelRef[]; decoders: ModelRef[] }
   | { id: number; type: "convert"; setup: Setup; encoder: ModelRef; decoder: ModelRef; wav: Float32Array };
 
 export interface PrepareResult {
