@@ -7,7 +7,7 @@ const manifest = (): Manifest => ({
   version: 2, sampleRate: 16000, hop: 320, maxSeconds: 120,
   encoders: [{ ...entry("sv"), targetDbfs: -20, maxGainDb: 40 }, { ...entry("original"), targetDbfs: null, maxGainDb: null }],
   decoders: [entry("sv-narrator"), entry("sv-narrator-bigvgan"), entry("googletts"), entry("googletts-bigvgan")].map((d) => ({
-    ...d, language: d.id.startsWith("googletts") ? "en" : "sv",
+    ...d, language: d.id.startsWith("googletts") ? "en" : "sv", vocoderFineTuned: d.id === "sv-narrator-bigvgan", melMap: d.id === "googletts-bigvgan",
     ...(d.id.endsWith("bigvgan") ? { vocoder: "bigvgan22k", sampleRate: 22050, hop: 256 } : { vocoder: "hifigan16k", sampleRate: 16000, hop: 320 }),
   })),
 });
@@ -29,6 +29,19 @@ describe("parseManifest", () => {
   });
   test("keeps each voice's language", () => {
     expect(parseManifest(manifest()).decoders.map((d) => d.language)).toEqual(["sv", "sv", "en", "en"]);
+  });
+  test("keeps whether a voice's vocoder is fine-tuned or its mel converted", () => {
+    expect(parseManifest(manifest()).decoders.map((d) => [d.id, d.vocoderFineTuned, d.melMap])).toEqual([
+      ["sv-narrator", false, false], ["sv-narrator-bigvgan", true, false], ["googletts", false, false], ["googletts-bigvgan", false, true],
+    ]);
+  });
+  test("voices from before those flags have neither", () => {
+    const m = manifest();
+    for (const d of m.decoders) {
+      delete (d as Partial<typeof d>).vocoderFineTuned;
+      delete (d as Partial<typeof d>).melMap;
+    }
+    expect(parseManifest(m).decoders.every((d) => d.vocoderFineTuned === false && d.melMap === false)).toBe(true);
   });
   test("voices from before languages: googletts is English, the narrator Swedish", () => {
     const m = manifest();

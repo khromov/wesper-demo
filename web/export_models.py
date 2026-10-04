@@ -464,6 +464,8 @@ def main(argv=None):
                                                    " its electric buzz (decoder/finetune_vocoder.py)" if voc_checkpoint else "")
             manifest["decoders"].append({"id": did, "language": entry["language"], "label": entry["label"], "description": description,
                                          "vocoder": voc.name, "sampleRate": voc.sample_rate, "hop": voc.hop,
+                                         # for the app's how-it-works diagram: the run's own vocoder, or the mel map
+                                         "vocoderFineTuned": bool(voc_checkpoint), "melMap": mel_map is not None,
                                          "source": source, "file": info, "checks": checks})
             del fs2
 

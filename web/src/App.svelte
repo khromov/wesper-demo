@@ -1,5 +1,6 @@
 <script lang="ts">
   import { onMount } from "svelte";
+  import HowItWorks from "./components/HowItWorks.svelte";
   import PushToTalk from "./components/PushToTalk.svelte";
   import Segmented from "./components/Segmented.svelte";
   import TakeCard from "./components/TakeCard.svelte";
@@ -140,6 +141,8 @@
         <div class="banner warn small">{note}</div>
       {/each}
     </section>
+
+    <HowItWorks encoder={app.encoder} decoder={app.decoder} />
 
     <div class="status small" aria-live="polite">
       {#if status}

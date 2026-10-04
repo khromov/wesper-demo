@@ -30,6 +30,10 @@ export interface DecoderEntry extends ModelEntry {
   /** The output audio's sample rate, and its samples per mel frame. */
   sampleRate: number;
   hop: number;
+  /** The vocoder is the run's own, fine-tuned on this decoder's output (decoder/finetune_vocoder.py). */
+  vocoderFineTuned: boolean;
+  /** The decoder was trained for HiFi-GAN: its mel is converted to the vocoder's on the way (bigvgan_preview.py). */
+  melMap: boolean;
 }
 
 export interface Manifest {
@@ -82,7 +86,9 @@ export function parseManifest(json: unknown): Manifest {
   m.decoders = m.decoders.map((d, i) => {
     checkEntry(d, `decoder ${i}`);
     // models.json from before voices had a language: WESPER's English one, or the Swedish narrator
-    const v = { ...HIFIGAN16K, ...d, language: (d as Partial<DecoderEntry>).language ?? (d.id.startsWith("googletts") ? "en" : "sv") };
+    const o = d as Partial<DecoderEntry>;
+    const v = { ...HIFIGAN16K, ...d, language: o.language ?? (d.id.startsWith("googletts") ? "en" : "sv"),
+                vocoderFineTuned: o.vocoderFineTuned === true, melMap: o.melMap === true };
     const positive = (x: unknown) => Number.isInteger(x) && (x as number) > 0;
     if (typeof v.vocoder !== "string" || !positive(v.sampleRate) || !positive(v.hop))
       fail(`decoder ${d.id} needs a vocoder, a sampleRate and a hop`);

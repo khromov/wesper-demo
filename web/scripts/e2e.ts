@@ -7,6 +7,7 @@
 //     until Generate; then they convert and play. The two encoders give different results.
 //   - Every voice in models.json can be chosen by language and output model, and converts at its
 //     own sample rate (BigVGAN's 22.05 kHz too), on WASM and WebGPU, which agree; the voices differ.
+//   - "How it works" starts collapsed, and opened shows the selected encoder, voice and vocoder.
 //   - Old downloads are cleaned up, and a private window says it can't keep the models.
 //
 //   bun run test:e2e            # against the dev server (needs the models: see README.md)
@@ -42,6 +43,7 @@ if (!existsSync(join(MODELS_DIR, "models.json"))) {
 }
 interface VoiceInfo {
   id: string;
+  label: string;
   language: string;
   vocoder: string;
   sampleRate?: number;
@@ -314,6 +316,16 @@ try {
   check(state.backend === "webgpu", `WebGPU by default (${state.backend})`);
   check(state.isolated && state.threads > 1, `cross-origin isolated, ${state.threads} WASM threads`);
 
+  console.log("how it works");
+  const how = page.getByTestId("how-it-works");
+  check(!(await how.evaluate((d: HTMLDetailsElement) => d.open)) && !(await page.getByTestId("how-decoder").isVisible()),
+        "starts collapsed");
+  await how.locator("summary").click();
+  const shown = async () => Promise.all(["how-encoder", "how-decoder", "how-vocoder"].map((id) => page.getByTestId(id).innerText()));
+  const names = await shown();
+  check(names.join() === "Swedish,Swedish narrator,HiFi-GAN 16 kHz", `opened, it shows the selected models (${names.join(", ")})`);
+  await how.locator("summary").click();
+
   console.log("push-to-talk with the mouse");
   const ptt = page.getByRole("button", { name: /Hold to whisper/ });
   await ptt.hover();
@@ -400,9 +412,12 @@ try {
   await page.waitForFunction(() => (window as any).__wesper.takes.length > 0, null, { timeout: STEP_MS });
   const voiceTake: number = await page.evaluate(() => (window as any).__wesper.takes[0].id);
   t = await waitForOutputs(page, voiceTake, 1);
+  await page.getByTestId("how-it-works").locator("summary").click();
   for (const [i, v] of order.entries()) {
     if (i === 0) continue; // converted with the default voice already
     await chooseVoice(page, v);
+    const [voice, vocoder] = await Promise.all(["how-decoder", "how-vocoder"].map((id) => page.getByTestId(id).innerText()));
+    check(voice === v.label && vocoder.startsWith(VOCODER_NAMES[v.vocoder]), `how it works follows: ${voice}, ${vocoder}`);
     await waitForReady(page);
     await page.locator(`[data-take="${voiceTake}"]`).getByRole("button", { name: "Run again" }).click();
     t = await waitForOutputs(page, voiceTake, i + 1);

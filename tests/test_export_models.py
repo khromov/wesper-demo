@@ -371,6 +371,8 @@ class ExportSmoke(unittest.TestCase):
                 self.assertEqual((d["vocoder"], d["sampleRate"], d["hop"]),
                                  ("bigvgan22k", 22050, 256) if d["id"].endswith("-bigvgan") else ("hifigan16k", 16000, 320))
                 self.assertEqual(d["language"], "en" if d["id"].startswith("googletts") else "sv")
+                self.assertEqual(d["melMap"], d["id"] == "googletts-bigvgan")
+                self.assertIsInstance(d["vocoderFineTuned"], bool)
             self.assertEqual(sorted(f for f in os.listdir(out) if f.endswith(".onnx")),
                              sorted([f"encoder-{e['id']}.onnx" for e in manifest["encoders"]] +
                                     [f"decoder-{d['id']}.onnx" for d in manifest["decoders"]]))
