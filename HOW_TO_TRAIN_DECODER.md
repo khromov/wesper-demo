@@ -66,6 +66,8 @@ python decoder/train.py decoder/data/sv-narrator-bigvgan22k decoder/runs/sv-narr
 - **Checkpoint:** BigVGAN's 449 MB checkpoint downloads on first use.
 - **CPU:** BigVGAN is slow on a CPU (about 1.4× real time on a MacBook), so the GUI responds
   more slowly than with HiFi-GAN.
+- **Web app:** `web/export_models.py` adds this run as a third voice, *Swedish narrator
+  (BigVGAN)*, when the folder exists (see web/README.md).
 
 ## Checking the setup
 

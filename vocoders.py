@@ -26,7 +26,8 @@ import torch
 import torch.nn.functional as F
 
 REPO = os.path.dirname(os.path.abspath(__file__))
-UNIT_SECONDS = 0.02  # the encoder's units: one per 320 samples at 16 kHz
+UNIT_SAMPLE_RATE, UNIT_HOP = 16000, 320  # the encoder's units: one per 320 samples at 16 kHz
+UNIT_SECONDS = UNIT_HOP / UNIT_SAMPLE_RATE
 DEFAULT = "hifigan16k"
 ALIASES = {"bigvgan22k": "bigvgan:bigvgan_v2_22khz_80band_fmax8k_256x"}
 WESPER_RELEASE = "https://github.com/rkmt/wesper-demo/releases/download/v0.1"
@@ -113,8 +114,11 @@ def mel_energy(x, s=HIFIGAN16K):
 
 
 def n_frames(n_units, s):
-    """How many of the vocoder's frames the decoder makes from n_units speech units."""
-    return n_units if s.one_frame_per_unit else int(n_units * UNIT_SECONDS / s.frame_seconds)
+    """How many of the vocoder's frames the decoder makes from n_units speech units: as many as
+    fit in their duration. Integer arithmetic, so the browser export computes exactly the same."""
+    if s.one_frame_per_unit:
+        return n_units
+    return n_units * UNIT_HOP * s.sample_rate // (UNIT_SAMPLE_RATE * s.hop)
 
 
 def units_to_frames(units, frames, s):

@@ -3,14 +3,19 @@
 The wrapper tests check each rewritten operation against the PyTorch code it replaces, and that
 small exported graphs keep their lengths dynamic. The model tests need WESPER's checkpoints in
 torch's hub cache (any earlier conversion run puts them there) and are skipped otherwise. The
-export smoke test runs the whole script (~2 min) and is opt-in:
+BigVGAN tests run its 449 MB vocoder and are opt-in, like those in test_vocoders.py; without a
+BigVGAN-trained run in decoder/runs, they use a stand-in: the narrator's HiFi-GAN-trained weights
+set up for BigVGAN (stand_in_bigvgan_run), which runs the same graph and sounds rougher. The
+export smoke test runs the whole script (~2 min, ~5 with WESPER_BIGVGAN) and is opt-in too:
 
     .venv/bin/python -m unittest tests.test_export_models -v
-    WESPER_EXPORT_SMOKE=1 .venv/bin/python -m unittest tests.test_export_models -v
+    WESPER_BIGVGAN=1 .venv/bin/python -m unittest tests.test_export_models -v
+    WESPER_EXPORT_SMOKE=1 WESPER_BIGVGAN=1 .venv/bin/python -m unittest tests.test_export_models -v
 
 A watchdog dumps stacks and exits if the module runs longer than WESPER_EXPORT_TEST_TIMEOUT
-seconds (default 900).
+seconds (default 1800).
 """
+import dataclasses
 import faulthandler
 import hashlib
 import json
@@ -30,16 +35,34 @@ CACHE = os.path.join(torch.hub.get_dir(), "checkpoints")
 CACHED = [os.path.join(CACHE, f) for f in ("model-layer12-450000.pt", "googletts_neutral_best.tar", "g_00205000")]
 SV_ENCODER = os.path.join(REPO, "colab", "data", "runs", "n2w-finetune", "encoder_best.pt")
 SV_DECODER = os.path.join(REPO, "decoder", "runs", "sv-narrator")  # decoder/train.py run folder
+SV_BIGVGAN_DECODER = os.path.join(REPO, "decoder", "runs", "sv-narrator-bigvgan22k")
+BIGVGAN = os.path.join(CACHE, "bigvgan", "bigvgan_v2_22khz_80band_fmax8k_256x")
+WITH_BIGVGAN = bool(os.environ.get("WESPER_BIGVGAN")) and os.path.exists(os.path.join(BIGVGAN, "bigvgan_generator.pt"))
 
 sys.path.insert(0, os.path.join(REPO, "web"))
 import export_models as em  # noqa: E402
 from model.modules import LengthRegulator  # noqa: E402  (FastSpeech2, on the path via export_models)
+from decoder import train  # noqa: E402  (the repo is on the path via export_models)
+
+# bigvgan22k's audio and frame settings, without fetching its config.json
+BIGVGAN22K = em.vocoders.Spec("bigvgan22k", 22050, 1024, 256, 1024, 80, 0, 8000, "")
+
+
+def stand_in_bigvgan_run(run):
+    """A decoder/train.py run folder for BigVGAN made from the HiFi-GAN narrator run: its weights,
+    with the preprocess.yaml train.py writes for bigvgan22k. For testing the export only."""
+    os.makedirs(run, exist_ok=True)
+    for f in ("decoder_best.pt", "stats.json"):
+        os.symlink(os.path.join(SV_DECODER, f), os.path.join(run, f))
+    with open(os.path.join(run, "preprocess.yaml"), "w") as f:
+        em.yaml.safe_dump(train.configs(run, em.vocoders.spec("bigvgan22k"))[0], f, sort_keys=False)
+    return run
 
 _cwd = os.getcwd()
 
 
 def setUpModule():
-    faulthandler.dump_traceback_later(int(os.environ.get("WESPER_EXPORT_TEST_TIMEOUT", 900)), exit=True)
+    faulthandler.dump_traceback_later(int(os.environ.get("WESPER_EXPORT_TEST_TIMEOUT", 1800)), exit=True)
     os.chdir(REPO)  # FastSpeech2 and HiFi-GAN read their configs by paths relative to the repo
     torch.set_grad_enabled(False)
 
@@ -99,6 +122,21 @@ class Wrappers(unittest.TestCase):
         for x, y in zip(inputs, run_onnx(m, torch.rand(1, 5, 1), inputs)):
             np.testing.assert_array_equal(y, m(x).numpy())
 
+    def test_units_to_frames_matches_vocoders(self):
+        for n in (1, 2, 7, 92, 2304, 6000):  # 2304: n_frames is an exact integer there; 6000: 2 minutes
+            units = torch.randn(n, 8)
+            expected = em.vocoders.units_to_frames(units.numpy(), em.vocoders.n_frames(n, BIGVGAN22K), BIGVGAN22K)
+            np.testing.assert_allclose(em.units_to_frames(units[None], BIGVGAN22K)[0].numpy(), expected, atol=1e-6)
+
+    def test_units_to_frames_export_follows_the_input(self):
+        class M(nn.Module):
+            def forward(self, x):
+                return em.units_to_frames(x, BIGVGAN22K)
+        inputs = [torch.randn(1, n, 8) for n in (1, 7, 92, 301)]
+        for x, y in zip(inputs, run_onnx(M(), torch.randn(1, 50, 8), inputs)):
+            self.assertEqual(y.shape[1], em.vocoders.n_frames(x.shape[1], BIGVGAN22K))
+            np.testing.assert_allclose(y, M()(x).numpy(), atol=1e-6)
+
 
 @unittest.skipUnless(all(os.path.exists(p) for p in CACHED), "WESPER's checkpoints aren't cached yet")
 class AgainstCheckpoints(unittest.TestCase):
@@ -138,13 +176,20 @@ class AgainstCheckpoints(unittest.TestCase):
 
 
 class RunConfigs(unittest.TestCase):
-    def test_refuses_decoders_for_other_vocoders(self):
+    @unittest.skipUnless(os.path.exists(os.path.join(BIGVGAN, "config.json")), "BigVGAN's config.json isn't cached yet")
+    def test_reads_a_bigvgan_runs_vocoder(self):
         with tempfile.TemporaryDirectory() as run:
             with open(os.path.join(run, "preprocess.yaml"), "w") as f:
                 f.write("path: {preprocessed_path: x}\nvocoder: {name: bigvgan22k}\n")
-            with self.assertRaises(SystemExit) as e:
-                em.load_run_configs(run, {})
-            self.assertIn("HiFi-GAN", str(e.exception))
+            voc = em.run_vocoder(em.load_run_configs(run, {})[0])
+            self.assertEqual((voc.name, voc.sample_rate, voc.hop, voc.n_mels), ("bigvgan22k", 22050, 256, 80))
+            self.assertEqual(voc, dataclasses.replace(BIGVGAN22K, checkpoint=voc.checkpoint))
+
+    def test_runs_without_a_vocoder_are_hifigan(self):
+        with tempfile.TemporaryDirectory() as run:
+            with open(os.path.join(run, "preprocess.yaml"), "w") as f:
+                f.write("path: {preprocessed_path: x}\n")
+            self.assertEqual(em.run_vocoder(em.load_run_configs(run, {})[0]), em.vocoders.HIFIGAN16K)
 
     def test_finds_stats_in_the_run_folder_wherever_it_is(self):
         with tempfile.TemporaryDirectory() as run:
@@ -178,17 +223,78 @@ class NarratorDecoder(unittest.TestCase):
         self.assertEqual(len(ref), self.units.shape[1] * em.HOP + 8)
 
 
+def has_run(folder):
+    return os.path.exists(os.path.join(folder, "decoder_best.pt"))
+
+
+@unittest.skipUnless(WITH_BIGVGAN, "set WESPER_BIGVGAN=1 to run BigVGAN (and have its checkpoint cached)")
+@unittest.skipUnless(all(os.path.exists(p) for p in CACHED), "WESPER's checkpoints aren't cached yet")
+@unittest.skipUnless(has_run(SV_BIGVGAN_DECODER) or has_run(SV_DECODER), "no narrator decoder run in decoder/runs")
+class BigVGANDecoder(unittest.TestCase):
+    """A decoder trained for BigVGAN (or the stand-in): units moved to BigVGAN's frames, FastSpeech2
+    and BigVGAN in one graph, against units2wav()."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.TemporaryDirectory()
+        run = SV_BIGVGAN_DECODER if has_run(SV_BIGVGAN_DECODER) else stand_in_bigvgan_run(os.path.join(cls.tmp.name, "run"))
+        cls.configs = em.load_run_configs(run, em.load_configs()[1])
+        cls.voc = em.run_vocoder(cls.configs[0])
+        cls.fs2 = em.wn.load_fastspeech2(cls.configs, checkpoint_path=os.path.join(run, "decoder_best.pt"), device="cpu")
+        cls.vocoder = em.vocoders.load(cls.voc)
+        torch.manual_seed(0)
+        cls.mel = torch.randn(1, cls.voc.n_mels, 30) - 5
+        cls.before = cls.vocoder(cls.mel)
+        cls.filters = em.fixed_bigvgan_filters(cls.vocoder, cls.voc.n_mels)
+        wav, _ = sf.read(os.path.join(REPO, "sample_whisper.wav"), dtype="float32")
+        cls.units = em.reference_units(em.wn.load_hubert(CACHED[0], device="cpu"), wav)
+        cls.ref = em.reference_wav(cls.fs2, cls.vocoder, cls.units, cls.voc)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.tmp.cleanup()
+
+    def test_fixed_filters_leave_the_output_unchanged(self):
+        self.assertGreater(self.filters, 100)
+        torch.testing.assert_close(self.vocoder(self.mel), self.before, rtol=0, atol=1e-6)
+
+    def test_reference_wav_is_units2wav(self):
+        gui, _ = em.wn.units2wav(self.units, self.fs2, self.vocoder, self.configs[1], self.configs[0], device="cpu",
+                                 vocoder_spec=self.voc)
+        np.testing.assert_array_equal((np.clip(self.ref.numpy(), -1, 1) * 32767).astype("int16"), gui)
+
+    def test_one_frame_per_bigvgan_frame(self):
+        # The duration predictor keeps durations at 1, as the app's e2e test expects.
+        self.assertEqual(len(self.ref), em.vocoders.n_frames(self.units.shape[1], self.voc) * self.voc.hop)
+
+    def test_decoder_wrapper_matches_reference(self):
+        wav = em.DecoderExport(self.fs2, self.vocoder, self.voc).eval()(self.units)[0]
+        self.assertEqual(len(wav), len(self.ref))
+        self.assertGreater(em.snr_db(self.ref, wav), em.MIN_SNR_DB)
+
+    def test_onnx_export_matches_reference(self):
+        # export_decoder checks the file against reference_wav on each input, and raises if they disagree
+        units = [self.units.numpy(), self.units[:, :57].numpy()]
+        info, checks = em.export_decoder(self.fs2, self.vocoder, "test", self.tmp.name, units, lambda s: None, self.voc)
+        self.assertEqual(len(checks), 2)
+        self.assertGreater(info["bytes"], 400e6)
+
+
 @unittest.skipUnless(os.environ.get("WESPER_EXPORT_SMOKE"), "set WESPER_EXPORT_SMOKE=1 to run the full export")
 @unittest.skipUnless(all(os.path.exists(p) for p in CACHED), "WESPER's checkpoints aren't cached yet")
 class ExportSmoke(unittest.TestCase):
     def test_full_export(self):
-        has_sv = os.path.exists(SV_ENCODER)
-        with tempfile.TemporaryDirectory() as out:
-            args = [sys.executable, os.path.join(REPO, "web", "export_models.py"), "--out", out, "--timeout", "800"]
+        has_sv, has_sv_decoder = os.path.exists(SV_ENCODER), has_run(SV_DECODER)
+        with tempfile.TemporaryDirectory() as out, tempfile.TemporaryDirectory() as runs:
+            args = [sys.executable, os.path.join(REPO, "web", "export_models.py"), "--out", out, "--timeout", "1500"]
             args += ["--original", CACHED[0], "--fastspeech2", CACHED[1], "--hifigan", CACHED[2]]
             if not has_sv:
                 args += ["--sv", ""]
-            r = subprocess.run(args, capture_output=True, text=True, timeout=900, cwd=tempfile.gettempdir())
+            bigvgan_run = SV_BIGVGAN_DECODER if has_run(SV_BIGVGAN_DECODER) else None
+            if not bigvgan_run and WITH_BIGVGAN and has_sv_decoder:
+                bigvgan_run = stand_in_bigvgan_run(os.path.join(runs, "run"))
+            args += ["--sv-bigvgan-decoder", bigvgan_run or ""]
+            r = subprocess.run(args, capture_output=True, text=True, timeout=1600, cwd=tempfile.gettempdir())
             self.assertEqual(r.returncode, 0, r.stdout[-3000:] + r.stderr[-3000:])
 
             manifest = json.load(open(os.path.join(out, "models.json")))
@@ -198,8 +304,11 @@ class ExportSmoke(unittest.TestCase):
             self.assertEqual((original["targetDbfs"], original["maxGainDb"]), (None, None))
             if has_sv:
                 self.assertEqual((manifest["encoders"][0]["targetDbfs"], manifest["encoders"][0]["maxGainDb"]), (-20.0, 40.0))
-            has_sv_decoder = os.path.exists(os.path.join(SV_DECODER, "decoder_best.pt"))
-            self.assertEqual([d["id"] for d in manifest["decoders"]], ["sv-narrator", "googletts"] if has_sv_decoder else ["googletts"])
+            expected = ["sv-narrator"] * has_sv_decoder + ["sv-narrator-bigvgan"] * bool(bigvgan_run) + ["googletts"]
+            self.assertEqual([d["id"] for d in manifest["decoders"]], expected)
+            for d in manifest["decoders"]:
+                self.assertEqual((d["vocoder"], d["sampleRate"], d["hop"]),
+                                 ("bigvgan22k", 22050, 256) if d["id"] == "sv-narrator-bigvgan" else ("hifigan16k", 16000, 320))
             self.assertEqual(sorted(f for f in os.listdir(out) if f.endswith(".onnx")),
                              sorted([f"encoder-{e['id']}.onnx" for e in manifest["encoders"]] +
                                     [f"decoder-{d['id']}.onnx" for d in manifest["decoders"]]))

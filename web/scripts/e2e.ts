@@ -2,7 +2,8 @@
 // sample_whisper.wav, and checks every path a person would use.
 //   - The Swedish encoder, the Swedish narrator voice and WebGPU are the defaults.
 //   - Push-to-talk works with the mouse and with Space, and converts with both encoders.
-//   - Comparing voices converts with every encoder and voice, and the voices sound different.
+//   - Comparing voices converts with every encoder and voice in models.json, each voice at its
+//     own sample rate (BigVGAN's 22.05 kHz too), on WASM and WebGPU, and the voices differ.
 //   - An uploaded file converts too, and "Run again" works after switching to WASM.
 //   - WebGPU and WASM agree, and the two encoders give different results.
 //   - Old downloads are cleaned up, and a private window says it can't keep the models.
@@ -10,12 +11,14 @@
 //   bun run test:e2e            # against the dev server (needs the models: see README.md)
 //   bun run test:e2e --preview  # against a production build (vite build + vite preview)
 //   bun run test:e2e --pages    # a production build set up like GitHub Pages + models on S3
+//   bun run test:e2e --models DIR  # with the models in DIR (an export_models.py --out), served
+//                                  # from another origin, as with --pages
 //   bun run test:e2e --headed   # watch it happen
-// Each step has a timeout, and the whole run is killed after 15 minutes.
+// Each step has a timeout, and the whole run is killed after 20 minutes.
 import { spawn } from "node:child_process";
 import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { chromium, type Page } from "playwright-core";
 import { decodeWav } from "../src/lib/audio/wav";
 
@@ -26,14 +29,22 @@ const PORT = 5199;
 const STEP_MS = 5 * 60_000;
 
 const watchdog = setTimeout(() => {
-  console.error("e2e: still running after 15 minutes, giving up");
+  console.error("e2e: still running after 20 minutes, giving up");
   process.exit(1);
-}, 15 * 60_000);
+}, 20 * 60_000);
 
-if (!existsSync(join(WEB, "public", "models", "models.json"))) {
-  console.error("e2e: no models in web/public/models. Run: .venv/bin/python web/export_models.py");
+const modelsArg = process.argv.indexOf("--models");
+const MODELS_DIR = modelsArg > 0 ? resolve(process.argv[modelsArg + 1] ?? "") : join(WEB, "public", "models");
+if (!existsSync(join(MODELS_DIR, "models.json"))) {
+  console.error(`e2e: no models in ${MODELS_DIR}. Run: .venv/bin/python web/export_models.py`);
   process.exit(1);
 }
+interface VoiceInfo {
+  id: string;
+  sampleRate?: number;
+  hop?: number;
+}
+const VOICES: VoiceInfo[] = JSON.parse(readFileSync(join(MODELS_DIR, "models.json"), "utf8")).decoders;
 
 // dev: Vite's dev server. preview: a production build on Vite's preview server. pages: a
 // production build as GitHub Pages serves it, under /wesper-demo/ and without the COOP/COEP
@@ -41,6 +52,9 @@ if (!existsSync(join(WEB, "public", "models", "models.json"))) {
 const MODE = process.argv.includes("--pages") ? "pages" : process.argv.includes("--preview") ? "preview" : "dev";
 const MODELS_PORT = 5299;
 const APP_URL = `http://localhost:${PORT}/${MODE === "pages" ? "wesper-demo/" : ""}`;
+// The models on their own origin, as on S3: for --pages, and for --models in any mode.
+const MODELS_ELSEWHERE = MODE === "pages" || modelsArg > 0;
+const modelsEnv: Record<string, string> = MODELS_ELSEWHERE ? { VITE_MODELS_URL: `http://localhost:${MODELS_PORT}/` } : {};
 
 function build(env: Record<string, string> = {}) {
   const r = Bun.spawnSync(["bunx", "vite", "build"], { cwd: WEB, env: { ...process.env, ...env }, timeout: 5 * 60_000 });
@@ -64,28 +78,30 @@ function serveStatic(port: number, dir: string, prefix: string, headers: Record<
 }
 
 let serverLog = "";
-let stopServers: () => void;
+const stops: (() => void)[] = [];
+const stopServers = () => stops.forEach((stop) => stop());
+if (MODELS_ELSEWHERE) {
+  const models = serveStatic(MODELS_PORT, MODELS_DIR, "/", { "Access-Control-Allow-Origin": "*" });
+  stops.push(() => models.stop(true));
+}
 if (MODE === "pages") {
-  build({ VITE_MODELS_URL: `http://localhost:${MODELS_PORT}/` });
+  build(modelsEnv);
   if (existsSync(join(WEB, "dist", "models"))) {
     console.error("e2e: the build still contains models/, though they're hosted elsewhere");
     process.exit(1);
   }
   const site = serveStatic(PORT, join(WEB, "dist"), "/wesper-demo/");
-  const models = serveStatic(MODELS_PORT, join(WEB, "public", "models"), "/", { "Access-Control-Allow-Origin": "*" });
-  stopServers = () => {
-    site.stop(true);
-    models.stop(true);
-  };
+  stops.push(() => site.stop(true));
 } else {
-  if (MODE === "preview") build();
+  if (MODE === "preview") build(modelsEnv);
   const server = spawn("bunx", ["vite", ...(MODE === "preview" ? ["preview"] : []), "--port", String(PORT), "--strictPort"], {
     cwd: WEB,
+    env: { ...process.env, ...modelsEnv },
     stdio: ["ignore", "pipe", "pipe"],
   });
   server.stdout.on("data", (d) => (serverLog += d));
   server.stderr.on("data", (d) => (serverLog += d));
-  stopServers = () => server.kill();
+  stops.push(() => server.kill());
 }
 
 /** Opens the app. On the Pages setup, coi-serviceworker reloads it once to add the headers;
@@ -205,17 +221,28 @@ function check(cond: unknown, msg: string) {
   console.log(`  ok  ${msg}`);
 }
 
+/** How many samples a voice makes from n samples of 16 kHz input, as in Python. */
+function outputLength(voice: string, n: number) {
+  const v = VOICES.find((d) => d.id === voice)!;
+  const [rate, hop] = [v.sampleRate ?? 16000, v.hop ?? 320];
+  const units = Math.floor(n / 320);
+  // HiFi-GAN 16 kHz: 320 per 20 ms unit, plus 8 from its upsampling (its x5 layer adds one)
+  if (rate === 16000 && hop === 320) return units * 320 + 8;
+  // others: the units moved to the vocoder's frames (vocoders.n_frames), hop samples each
+  return Math.floor((units * 320 * rate) / (16000 * hop)) * hop;
+}
+
 function checkTake(t: TakeInfo, backend: string, from = 0, pairs = ["sv:sv-narrator", "original:sv-narrator"]) {
   const outs = t.outputs.slice(from);
   const got = outs.map((o) => `${o.encoder}:${o.decoder}`);
   check(got.join() === pairs.join(), `take ${t.id}: converted as ${pairs.join(", then ")} (${got})`);
   for (const o of outs) {
-    check(o.status === "done", `take ${t.id} ${o.encoder}: done${o.error ? ` (${o.error})` : ""}`);
-    check(o.backend === backend, `take ${t.id} ${o.encoder}: ran on ${o.backend}`);
-    // 320 per 20 ms frame, plus 8 from HiFi-GAN's upsampling (its x5 layer adds one), as in Python
-    check(o.samples === Math.floor(t.samples / 320) * 320 + 8, `take ${t.id} ${o.encoder}: ${o.samples} samples for ${t.samples} in`);
-    check(o.finite && o.rmsDb > -40, `take ${t.id} ${o.encoder}: audible, finite output (${o.rmsDb.toFixed(1)} dBFS RMS)`);
-    console.log(`      ${o.encoder} ${o.backend}: ${(o.ms / 1000).toFixed(2)} s for ${(t.samples / 16000).toFixed(1)} s of audio`);
+    const name = `take ${t.id} ${o.encoder}:${o.decoder}`;
+    check(o.status === "done", `${name}: done${o.error ? ` (${o.error})` : ""}`);
+    check(o.backend === backend, `${name}: ran on ${o.backend}`);
+    check(o.samples === outputLength(o.decoder, t.samples), `${name}: ${o.samples} samples for ${t.samples} in`);
+    check(o.finite && o.rmsDb > -40, `${name}: audible, finite output (${o.rmsDb.toFixed(1)} dBFS RMS)`);
+    console.log(`      ${o.encoder}:${o.decoder} ${o.backend}: ${(o.ms / 1000).toFixed(2)} s for ${(t.samples / 16000).toFixed(1)} s of audio`);
   }
 }
 
@@ -310,16 +337,32 @@ try {
   );
   check((await cached()).sort().join() === before.sort().join(), "a download no longer in models.json is deleted, the models stay");
 
-  console.log("comparing voices");
+  console.log(`comparing voices: ${VOICES.map((v) => v.id).join(", ")}`);
   await page.getByLabel(/Also convert with the .* voice/).check();
   await waitForReady(page);
   await page.getByTestId("file").setInputFiles(SAMPLE); // the reload above cleared the takes: a new one
   await page.waitForFunction(() => (window as any).__wesper.takes.length > 0, null, { timeout: STEP_MS });
   const voiceTake: number = await page.evaluate(() => (window as any).__wesper.takes[0].id);
-  t = await waitForOutputs(page, voiceTake, 4);
-  checkTake(t, "wasm", 0, ["sv:sv-narrator", "sv:googletts", "original:sv-narrator", "original:googletts"]);
-  const voices = await snr(page, voiceTake, 0, 1);
-  check(voices < 20, `the two voices give different audio (${voices.toFixed(1)} dB SNR)`);
+  const voiceOrder = ["sv-narrator", ...VOICES.map((v) => v.id).filter((id) => id !== "sv-narrator")];
+  const voicePairs = ["sv", "original"].flatMap((e) => voiceOrder.map((d) => `${e}:${d}`));
+  t = await waitForOutputs(page, voiceTake, voicePairs.length);
+  checkTake(t, "wasm", 0, voicePairs);
+  for (let i = 1; i < voiceOrder.length; i++) {
+    if (t.outputs[i].samples !== t.outputs[0].samples) continue; // another sample rate: different anyway
+    const voices = await snr(page, voiceTake, 0, i);
+    check(voices < 20, `the ${voiceOrder[0]} and ${voiceOrder[i]} voices give different audio (${voices.toFixed(1)} dB SNR)`);
+  }
+
+  console.log("comparing voices on WebGPU");
+  await page.getByRole("radio", { name: /^WebGPU/ }).click();
+  await waitForReady(page);
+  await page.locator(`[data-take="${voiceTake}"]`).getByRole("button", { name: "Run again" }).click();
+  t = await waitForOutputs(page, voiceTake, 2 * voicePairs.length);
+  checkTake(t, "webgpu", voicePairs.length, voicePairs);
+  for (let i = 0; i < voiceOrder.length; i++) {
+    const agree = await snr(page, voiceTake, i, voicePairs.length + i);
+    check(agree > 50, `WebGPU and WASM agree (${voicePairs[i]}: ${agree.toFixed(1)} dB SNR)`);
+  }
 
   check(consoleErrors.length === 0, `no console errors${consoleErrors.length ? `: ${consoleErrors.join(" | ")}` : ""}`);
 

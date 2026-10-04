@@ -6,7 +6,9 @@ const entry = (id: string) => ({ id, label: id, description: "", file: file(`${i
 const manifest = (): Manifest => ({
   version: 2, sampleRate: 16000, hop: 320, maxSeconds: 120,
   encoders: [{ ...entry("sv"), targetDbfs: -20, maxGainDb: 40 }, { ...entry("original"), targetDbfs: null, maxGainDb: null }],
-  decoders: [entry("sv-narrator"), entry("googletts")],
+  decoders: [entry("sv-narrator"), entry("sv-narrator-bigvgan"), entry("googletts")].map((d) => ({
+    ...d, ...(d.id.endsWith("bigvgan") ? { vocoder: "bigvgan22k", sampleRate: 22050, hop: 256 } : { vocoder: "hifigan16k", sampleRate: 16000, hop: 320 }),
+  })),
 });
 
 describe("parseManifest", () => {
@@ -15,6 +17,22 @@ describe("parseManifest", () => {
   });
   test("rejects other audio formats", () => {
     expect(() => parseManifest({ ...manifest(), sampleRate: 22050 })).toThrow("16 kHz");
+  });
+  test("keeps each voice's sample rate", () => {
+    expect(parseManifest(manifest()).decoders.map((d) => [d.id, d.vocoder, d.sampleRate, d.hop])).toEqual([
+      ["sv-narrator", "hifigan16k", 16000, 320],
+      ["sv-narrator-bigvgan", "bigvgan22k", 22050, 256],
+      ["googletts", "hifigan16k", 16000, 320],
+    ]);
+  });
+  test("voices without vocoder settings are HiFi-GAN 16 kHz, as before BigVGAN", () => {
+    const m = { ...manifest(), decoders: [entry("googletts")] };
+    expect(parseManifest(m).decoders[0]).toMatchObject({ vocoder: "hifigan16k", sampleRate: 16000, hop: 320 });
+  });
+  test("rejects a broken voice sample rate", () => {
+    const m = manifest();
+    m.decoders[1].sampleRate = 0;
+    expect(() => parseManifest(m)).toThrow("sv-narrator-bigvgan needs a vocoder, a sampleRate and a hop");
   });
   test("rejects a missing or broken file", () => {
     const m = manifest();
@@ -53,5 +71,5 @@ test("the Swedish narrator is the default voice when present", () => {
   m.decoders.reverse();
   expect(defaultDecoder(m)).toBe("sv-narrator");
   m.decoders = m.decoders.filter((d) => d.id !== "sv-narrator");
-  expect(defaultDecoder(m)).toBe("googletts");
+  expect(defaultDecoder(m)).toBe("googletts"); // otherwise the first one
 });

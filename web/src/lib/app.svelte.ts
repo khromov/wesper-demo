@@ -7,7 +7,7 @@ import { Engine } from "./engine/client";
 import type { ModelRef, Phase, Setup } from "./engine/protocol";
 import {
   defaultDecoder, defaultEncoder, fileUrl, parseManifest,
-  type Backend, type EncoderEntry, type Manifest, type ModelEntry,
+  type Backend, type DecoderEntry, type EncoderEntry, type Manifest, type ModelEntry,
 } from "./models/manifest";
 import { clearDownloads, pruneDownloads, storedBytes } from "./models/download";
 
@@ -31,11 +31,12 @@ export interface Settings {
 export interface Output {
   key: string;
   encoder: EncoderEntry;
-  decoder: ModelEntry;
+  decoder: DecoderEntry;
   backend: Backend;
   status: "queued" | "running" | "done" | "error";
   /** Gain applied to the input for this encoder, or null if it takes the input as-is. */
   gainDb: number | null;
+  /** At decoder.sampleRate. */
   samples: Float32Array | null;
   encodeMs: number;
   decodeMs: number;
@@ -315,7 +316,7 @@ export class App {
         const r = await this.engine.convert(setup, ref(out.encoder), ref(out.decoder), input, this.onProgress);
         this.loading = null;
         Object.assign(out, { samples: r.wav, encodeMs: r.encodeMs, decodeMs: r.decodeMs, status: "done" });
-        if (i === first && take === this.takes[0]) this.play(out.key, r.wav);
+        if (i === first && take === this.takes[0]) this.play(out.key, r.wav, out.decoder.sampleRate);
       } catch (e) {
         this.loading = null;
         Object.assign(out, { status: "error", error: e instanceof Error ? e.message : String(e) });
@@ -329,10 +330,10 @@ export class App {
 
   // ------------------------------------------------------------ playback
 
-  play(key: string, samples: Float32Array) {
+  play(key: string, samples: Float32Array, rate = SR) {
     this.audio();
     if (this.playing === key) this.player!.stop();
-    else this.player!.play(key, samples, SR);
+    else this.player!.play(key, samples, rate);
   }
 
   stop() {
@@ -345,6 +346,6 @@ export class App {
     if (!take) return;
     if (n === 0) return this.play(`${take.id}:input`, take.samples);
     const out = take.outputs[n - 1];
-    if (out?.samples) this.play(out.key, out.samples);
+    if (out?.samples) this.play(out.key, out.samples, out.decoder.sampleRate);
   }
 }

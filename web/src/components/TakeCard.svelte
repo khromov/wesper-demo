@@ -14,7 +14,7 @@
     take: Take;
     latest: boolean;
     playing: string | null;
-    onplay: (key: string, samples: Float32Array) => void;
+    onplay: (key: string, samples: Float32Array, rate: number) => void;
     onconvert: () => void;
     onremove: () => void;
   } = $props();
@@ -24,8 +24,8 @@
   const signed = (db: number) => `${db >= 0 ? "+" : "−"}${Math.abs(db).toFixed(1)} dB`;
   const backendName = { webgpu: "WebGPU", wasm: "WASM" };
 
-  function download(samples: Float32Array, name: string) {
-    const url = URL.createObjectURL(new Blob([encodeWav(samples, SR)], { type: "audio/wav" }));
+  function download(samples: Float32Array, rate: number, name: string) {
+    const url = URL.createObjectURL(new Blob([encodeWav(samples, rate)], { type: "audio/wav" }));
     const a = Object.assign(document.createElement("a"), { href: url, download: name });
     a.click();
     setTimeout(() => URL.revokeObjectURL(url), 10_000);
@@ -46,7 +46,7 @@
 
   <ol>
     <li class:playing={playing === inputKey} data-row="input">
-      <button class="play" onclick={() => onplay(inputKey, take.samples)} aria-label="Play input">
+      <button class="play" onclick={() => onplay(inputKey, take.samples, SR)} aria-label="Play input">
         {playing === inputKey ? "■" : "▶"}
       </button>
       <kbd class:hidden={!latest}>0</kbd>
@@ -54,11 +54,11 @@
         <span>Input</span>
         <span class="muted small">16 kHz, as recorded</span>
       </div>
-      <button class="dl" onclick={() => download(take.samples, `take${take.id}-input.wav`)} aria-label="Download input">⤓</button>
+      <button class="dl" onclick={() => download(take.samples, SR, `take${take.id}-input.wav`)} aria-label="Download input">⤓</button>
     </li>
     {#each take.outputs as out, i (out.key)}
       <li class:playing={playing === out.key} data-row="output" data-encoder={out.encoder.id} data-decoder={out.decoder.id} data-status={out.status}>
-        <button class="play" disabled={!out.samples} onclick={() => out.samples && onplay(out.key, out.samples)} aria-label="Play {out.encoder.label} encoder, {out.decoder.label} voice">
+        <button class="play" disabled={!out.samples} onclick={() => out.samples && onplay(out.key, out.samples, out.decoder.sampleRate)} aria-label="Play {out.encoder.label} encoder, {out.decoder.label} voice">
           {playing === out.key ? "■" : "▶"}
         </button>
         <kbd class:hidden={!latest}>{i + 1}</kbd>
@@ -83,7 +83,7 @@
         </div>
         {#if out.samples}
           {@const samples = out.samples}
-          <button class="dl" onclick={() => download(samples, `take${take.id}-${out.encoder.id}-${out.decoder.id}-${out.backend}.wav`)} aria-label="Download {out.encoder.label} encoder, {out.decoder.label} voice">⤓</button>
+          <button class="dl" onclick={() => download(samples, out.decoder.sampleRate, `take${take.id}-${out.encoder.id}-${out.decoder.id}-${out.backend}.wav`)} aria-label="Download {out.encoder.label} encoder, {out.decoder.label} voice">⤓</button>
         {/if}
       </li>
     {/each}

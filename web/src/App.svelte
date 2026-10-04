@@ -179,7 +179,7 @@
           {take}
           latest={i === 0}
           playing={app.playing}
-          onplay={(key, samples) => app.play(key, samples)}
+          onplay={(key, samples, rate) => app.play(key, samples, rate)}
           onconvert={() => void app.convert(take)}
           onremove={() => app.removeTake(take)}
         />
