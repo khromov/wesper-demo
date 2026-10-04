@@ -1,5 +1,5 @@
 <script lang="ts">
-  import type { Take } from "../lib/app.svelte";
+  import type { Output, Take } from "../lib/app.svelte";
   import { SR } from "../lib/audio/level";
   import { encodeWav } from "../lib/audio/wav";
 
@@ -8,6 +8,7 @@
     latest,
     playing,
     onplay,
+    ongenerate,
     onconvert,
     onremove,
   }: {
@@ -15,6 +16,8 @@
     latest: boolean;
     playing: string | null;
     onplay: (key: string, samples: Float32Array, rate: number) => void;
+    /** Converts one of the other options to compare with (or retries a failed one). */
+    ongenerate: (out: Output) => void;
     onconvert: () => void;
     onremove: () => void;
   } = $props();
@@ -58,9 +61,15 @@
     </li>
     {#each take.outputs as out, i (out.key)}
       <li class:playing={playing === out.key} data-row="output" data-encoder={out.encoder.id} data-decoder={out.decoder.id} data-status={out.status}>
-        <button class="play" disabled={!out.samples} onclick={() => out.samples && onplay(out.key, out.samples, out.decoder.sampleRate)} aria-label="Play {out.encoder.label} encoder, {out.decoder.label} voice">
-          {playing === out.key ? "■" : "▶"}
-        </button>
+        {#if out.status === "idle" || (out.status === "error" && i > 0)}
+          <button class="play generate" onclick={() => ongenerate(out)} aria-label="Generate {out.encoder.label} encoder, {out.decoder.label} voice">
+            {out.status === "idle" ? "Generate" : "Retry"}
+          </button>
+        {:else}
+          <button class="play" disabled={!out.samples} onclick={() => out.samples && onplay(out.key, out.samples, out.decoder.sampleRate)} aria-label="Play {out.encoder.label} encoder, {out.decoder.label} voice">
+            {playing === out.key ? "■" : "▶"}
+          </button>
+        {/if}
         <kbd class:hidden={!latest}>{i + 1}</kbd>
         <div class="what">
           <span>
@@ -68,7 +77,9 @@
             <span class="chip">{backendName[out.backend]}</span>
           </span>
           <span class="muted small">
-            {#if out.status === "queued"}
+            {#if out.status === "idle"}
+              Not converted yet{out.decoder.vocoder === "bigvgan22k" ? " · BigVGAN voices are a larger download" : ""}
+            {:else if out.status === "queued"}
               Waiting…
             {:else if out.status === "running"}
               Converting…
@@ -133,6 +144,13 @@
     border: none;
     background: var(--accent);
     color: var(--accent-text);
+    font-size: 13px;
+  }
+  .play.generate {
+    width: auto;
+    min-width: 36px;
+    border-radius: 18px;
+    padding: 0 12px;
     font-size: 13px;
   }
   .what {

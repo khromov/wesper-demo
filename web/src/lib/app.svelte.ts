@@ -6,7 +6,7 @@ import { resolve, type BackendChoice, type Capabilities } from "./engine/backend
 import { Engine } from "./engine/client";
 import type { ModelRef, Phase, Setup } from "./engine/protocol";
 import {
-  defaultDecoder, defaultEncoder, fileUrl, parseManifest,
+  defaultDecoder, defaultEncoder, fileUrl, parseManifest, voiceForLanguage,
   type Backend, type DecoderEntry, type EncoderEntry, type Manifest, type ModelEntry,
 } from "./models/manifest";
 import { clearDownloads, pruneDownloads, storedBytes } from "./models/download";
@@ -21,10 +21,8 @@ export interface Settings {
   /** The decoder, i.e. the voice the conversion speaks with. */
   decoder: string;
   backend: BackendChoice;
-  /** Also convert each take with the other encoder(s). */
+  /** Also list each take with the other encoder(s) and voices, converted only when asked (Generate). */
   compare: boolean;
-  /** Also convert each take with the other voice(s). */
-  compareVoices: boolean;
   microphone: string;
 }
 
@@ -33,7 +31,8 @@ export interface Output {
   encoder: EncoderEntry;
   decoder: DecoderEntry;
   backend: Backend;
-  status: "queued" | "running" | "done" | "error";
+  /** idle: one of the other options to compare with, not converted until asked (generate()). */
+  status: "idle" | "queued" | "running" | "done" | "error";
   /** Gain applied to the input for this encoder, or null if it takes the input as-is. */
   gainDb: number | null;
   /** At decoder.sampleRate. */
@@ -81,7 +80,7 @@ export class App {
   /** The last thing that went wrong, shown until dismissed. */
   error = $state("");
   notice = $state("");
-  settings = $state<Settings>({ encoder: "sv", decoder: "sv-narrator", backend: "auto", compare: true, compareVoices: false, microphone: "" });
+  settings = $state<Settings>({ encoder: "sv", decoder: "sv-narrator", backend: "auto", compare: false, microphone: "" });
   loading = $state<Loading | null>(null);
   ready = $state(false);
   takes = $state<Take[]>([]);
@@ -94,20 +93,17 @@ export class App {
 
   resolved = $derived(this.caps ? resolve(this.settings.backend, this.caps) : null);
   encoder = $derived(this.manifest?.encoders.find((e) => e.id === this.settings.encoder) ?? null);
-  /** Encoders each take is converted with, the selected one first. */
-  runEncoders = $derived.by(() => {
-    const m = this.manifest;
-    if (!m || !this.encoder) return [];
-    const selected = this.encoder;
-    return [selected, ...(this.settings.compare ? m.encoders.filter((e) => e.id !== selected.id) : [])];
-  });
   decoder = $derived(this.manifest?.decoders.find((d) => d.id === this.settings.decoder) ?? null);
-  /** Voices each take is converted with, the selected one first. */
-  runDecoders = $derived.by(() => {
+  /** The other options each take is listed with when comparing: the other encoders with the selected
+   *  voice, then the other voices with the selected encoder. Each is converted only on request. */
+  alternatives = $derived.by((): [EncoderEntry, DecoderEntry][] => {
     const m = this.manifest;
-    if (!m || !this.decoder) return [];
-    const selected = this.decoder;
-    return [selected, ...(this.settings.compareVoices ? m.decoders.filter((d) => d.id !== selected.id) : [])];
+    const [enc, dec] = [this.encoder, this.decoder];
+    if (!m || !enc || !dec) return [];
+    return [
+      ...m.encoders.filter((e) => e.id !== enc.id).map((e): [EncoderEntry, DecoderEntry] => [e, dec]),
+      ...m.decoders.filter((d) => d.id !== dec.id).map((d): [EncoderEntry, DecoderEntry] => [enc, d]),
+    ];
   });
   busy = $derived(this.takes.some((t) => t.outputs.some((o) => o.status === "queued" || o.status === "running")));
 
@@ -145,8 +141,7 @@ export class App {
       encoder: m.encoders.some((e) => e.id === prefs.encoder) ? prefs.encoder! : defaultEncoder(m),
       decoder: m.decoders.some((d) => d.id === prefs.decoder) ? prefs.decoder! : defaultDecoder(m),
       backend: (["auto", "webgpu", "wasm"] as const).includes(prefs.backend!) ? prefs.backend! : "auto",
-      compare: prefs.compare ?? true,
-      compareVoices: prefs.compareVoices ?? false,
+      compare: prefs.compare ?? false,
       microphone: prefs.microphone ?? "",
     };
     // Downloads of files no longer in models.json (earlier exports) only take up space.
@@ -172,7 +167,13 @@ export class App {
       // settings just aren't remembered
     }
     if ("microphone" in change) this.recorder?.close();
-    if (["encoder", "decoder", "backend", "compare", "compareVoices"].some((k) => k in change)) void this.prepare();
+    if (["encoder", "decoder", "backend"].some((k) => k in change)) void this.prepare();
+  }
+
+  /** Switches to a language's voice: with the same vocoder if it has one. */
+  chooseLanguage(language: string) {
+    if (this.manifest && this.decoder && language !== this.decoder.language)
+      this.update({ decoder: voiceForLanguage(this.manifest, language, this.decoder.vocoder) });
   }
 
   private setup(): Setup {
@@ -190,7 +191,8 @@ export class App {
     const run = ++this.prepareRun;
     this.ready = false;
     try {
-      const { notCached } = await this.engine.prepare(this.setup(), this.runEncoders.map(ref), this.runDecoders.map(ref), this.onProgress);
+      // Only the selected encoder and voice: the others load when one of their outputs is generated.
+      const { notCached } = await this.engine.prepare(this.setup(), [ref(this.encoder!)], [ref(this.decoder!)], this.onProgress);
       if (run === this.prepareRun) this.ready = true;
       if (notCached.length)
         this.notice = `This browser didn't let the page keep ${notCached.join(", ")} (a private window, or low on disk space?), so ${notCached.length > 1 ? "they download" : "it downloads"} again next visit.`;
@@ -296,31 +298,41 @@ export class App {
 
   // ------------------------------------------------------------ conversion
 
-  /** Converts a take with the current settings, adding one output per encoder and voice. Plays the first. */
+  /** Converts a take with the selected encoder and voice, and plays the result. When comparing, the other
+   *  options are listed too, unconverted until generate() (each may be another download). */
   async convert(take: Take) {
-    if (!this.manifest || !this.resolved) return;
-    const setup = this.setup();
-    const outputs = this.runEncoders.flatMap((encoder) => this.runDecoders.map((decoder): Output => ({
-      key: `${take.id}:${take.outputs.length}:${encoder.id}:${decoder.id}`,
-      encoder, decoder, backend: setup.backend, status: "queued",
+    if (!this.manifest || !this.resolved || !this.encoder || !this.decoder) return;
+    const backend = this.setup().backend;
+    const pairs: [EncoderEntry, DecoderEntry][] = [[this.encoder, this.decoder], ...(this.settings.compare ? this.alternatives : [])];
+    const first = take.outputs.length;
+    take.outputs.push(...pairs.map(([encoder, decoder], i): Output => ({
+      key: `${take.id}:${first + i}:${encoder.id}:${decoder.id}`,
+      encoder, decoder, backend, status: i === 0 ? "queued" : "idle",
       gainDb: encoder.targetDbfs === null ? null : normalizationGainDb(take.samples, encoder.targetDbfs, encoder.maxGainDb!),
       samples: null, encodeMs: 0, decodeMs: 0, error: "",
     })));
-    const first = take.outputs.length;
-    take.outputs.push(...outputs);
-    for (let i = first; i < take.outputs.length; i++) {
-      const out = take.outputs[i]; // the reactive copy
-      out.status = "running";
-      try {
-        const input = out.gainDb === null ? take.samples : applyGain(take.samples, out.gainDb);
-        const r = await this.engine.convert(setup, ref(out.encoder), ref(out.decoder), input, this.onProgress);
-        this.loading = null;
-        Object.assign(out, { samples: r.wav, encodeMs: r.encodeMs, decodeMs: r.decodeMs, status: "done" });
-        if (i === first && take === this.takes[0]) this.play(out.key, r.wav, out.decoder.sampleRate);
-      } catch (e) {
-        this.loading = null;
-        Object.assign(out, { status: "error", error: e instanceof Error ? e.message : String(e) });
-      }
+    await this.run(take, take.outputs[first], take === this.takes[0]); // the reactive copy
+  }
+
+  /** Converts one of a take's other options (or retries a failed output), with the current backend, and plays it. */
+  async generate(take: Take, out: Output) {
+    if (!this.resolved || (out.status !== "idle" && out.status !== "error")) return;
+    Object.assign(out, { backend: this.setup().backend, status: "queued", error: "" });
+    await this.run(take, out, true);
+  }
+
+  private async run(take: Take, out: Output, play: boolean) {
+    out.status = "running";
+    try {
+      const input = out.gainDb === null ? take.samples : applyGain(take.samples, out.gainDb);
+      const r = await this.engine.convert({ ...this.setup(), backend: out.backend }, ref(out.encoder), ref(out.decoder), input, this.onProgress);
+      Object.assign(out, { samples: r.wav, encodeMs: r.encodeMs, decodeMs: r.decodeMs, status: "done" });
+      if (play) this.play(out.key, r.wav, out.decoder.sampleRate);
+    } catch (e) {
+      Object.assign(out, { status: "error", error: e instanceof Error ? e.message : String(e) });
+    } finally {
+      this.loading = null;
+      this.stored = await storedBytes();
     }
   }
 
@@ -347,5 +359,6 @@ export class App {
     if (n === 0) return this.play(`${take.id}:input`, take.samples);
     const out = take.outputs[n - 1];
     if (out?.samples) this.play(out.key, out.samples, out.decoder.sampleRate);
+    else if (out?.status === "idle") void this.generate(take, out);
   }
 }

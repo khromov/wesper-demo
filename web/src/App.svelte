@@ -5,6 +5,7 @@
   import TakeCard from "./components/TakeCard.svelte";
   import { App } from "./lib/app.svelte";
   import type { BackendChoice } from "./lib/engine/backend";
+  import { languageLabel, languages, vocoderLabel } from "./lib/models/manifest";
 
   const app = new App();
   // For poking at the state from devtools, and for scripts/e2e.ts.
@@ -15,8 +16,9 @@
 
   const mb = (bytes: number) => (bytes >= 1e9 ? `${(bytes / 1e9).toFixed(1)} GB` : `${Math.round(bytes / 1e6)} MB`);
   const backendName = { webgpu: "WebGPU", wasm: "WebAssembly" };
-  const others = $derived(app.manifest?.encoders.filter((e) => e.id !== app.settings.encoder).map((e) => e.label) ?? []);
-  const otherVoices = $derived(app.manifest?.decoders.filter((d) => d.id !== app.settings.decoder).map((d) => d.label) ?? []);
+  /** The selected voice's language, and the voices (output models) it has. */
+  const language = $derived(app.decoder?.language ?? "");
+  const models = $derived(app.manifest?.decoders.filter((d) => d.language === language) ?? []);
 
   const status = $derived.by(() => {
     const l = app.loading;
@@ -95,14 +97,18 @@
           ]}
           onchange={(backend) => app.update({ backend })}
         />
-        <div class="wide">
-          <Segmented
-            label="Voice"
-            value={app.settings.decoder}
-            options={app.manifest.decoders.map((d) => ({ value: d.id, label: d.label }))}
-            onchange={(decoder) => app.update({ decoder })}
-          />
-        </div>
+        <Segmented
+          label="Language"
+          value={language}
+          options={languages(app.manifest).map((l) => ({ value: l, label: languageLabel(l) }))}
+          onchange={(l) => app.chooseLanguage(l)}
+        />
+        <Segmented
+          label="Output model"
+          value={app.settings.decoder}
+          options={models.map((d) => ({ value: d.id, label: vocoderLabel(d.vocoder) }))}
+          onchange={(decoder) => app.update({ decoder })}
+        />
       </div>
       {#if app.encoder}
         <p class="small muted desc">
@@ -114,16 +120,10 @@
         <p class="small muted desc">Voice: {app.decoder.description}.</p>
       {/if}
       <div class="row">
-        {#if others.length}
+        {#if app.alternatives.length}
           <label class="check">
             <input type="checkbox" checked={app.settings.compare} onchange={(e) => app.update({ compare: e.currentTarget.checked })} />
-            Also convert with {others.join(", ")}, to compare
-          </label>
-        {/if}
-        {#if otherVoices.length}
-          <label class="check">
-            <input type="checkbox" checked={app.settings.compareVoices} onchange={(e) => app.update({ compareVoices: e.currentTarget.checked })} />
-            Also convert with the {otherVoices.join(", ")} voice, to compare
+            Compare with the other options: each take also lists the other encoder and voices, to generate when you want them
           </label>
         {/if}
         <label class="mic small">
@@ -182,11 +182,12 @@
           latest={i === 0}
           playing={app.playing}
           onplay={(key, samples, rate) => app.play(key, samples, rate)}
+          ongenerate={(out) => void app.generate(take, out)}
           onconvert={() => void app.convert(take)}
           onremove={() => app.removeTake(take)}
         />
       {:else}
-        <p class="muted center small empty">Your takes appear here. Each one is converted with the encoders and voices above, and the first result plays automatically.</p>
+        <p class="muted center small empty">Your takes appear here. Each one is converted with the encoder and voice above, and the result plays automatically.</p>
       {/each}
     </section>
   {:else}
@@ -256,9 +257,6 @@
     display: grid;
     grid-template-columns: repeat(auto-fit, minmax(min(260px, 100%), 1fr));
     gap: 12px;
-  }
-  .wide {
-    grid-column: 1 / -1; /* the voices' labels are long, and there may be several */
   }
   .desc {
     margin: 0;

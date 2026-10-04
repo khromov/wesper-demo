@@ -1,13 +1,14 @@
 import { describe, expect, test } from "bun:test";
-import { defaultDecoder, defaultEncoder, fileUrl, parseManifest, type Manifest } from "./manifest";
+import { defaultDecoder, defaultEncoder, fileUrl, languages, parseManifest, voiceForLanguage, type Manifest } from "./manifest";
 
 const file = (path: string) => ({ path, bytes: 100, sha256: "ab".repeat(32) });
 const entry = (id: string) => ({ id, label: id, description: "", file: file(`${id}.onnx`) });
 const manifest = (): Manifest => ({
   version: 2, sampleRate: 16000, hop: 320, maxSeconds: 120,
   encoders: [{ ...entry("sv"), targetDbfs: -20, maxGainDb: 40 }, { ...entry("original"), targetDbfs: null, maxGainDb: null }],
-  decoders: [entry("sv-narrator"), entry("sv-narrator-bigvgan"), entry("googletts")].map((d) => ({
-    ...d, ...(d.id.endsWith("bigvgan") ? { vocoder: "bigvgan22k", sampleRate: 22050, hop: 256 } : { vocoder: "hifigan16k", sampleRate: 16000, hop: 320 }),
+  decoders: [entry("sv-narrator"), entry("sv-narrator-bigvgan"), entry("googletts"), entry("googletts-bigvgan")].map((d) => ({
+    ...d, language: d.id.startsWith("googletts") ? "en" : "sv",
+    ...(d.id.endsWith("bigvgan") ? { vocoder: "bigvgan22k", sampleRate: 22050, hop: 256 } : { vocoder: "hifigan16k", sampleRate: 16000, hop: 320 }),
   })),
 });
 
@@ -23,7 +24,16 @@ describe("parseManifest", () => {
       ["sv-narrator", "hifigan16k", 16000, 320],
       ["sv-narrator-bigvgan", "bigvgan22k", 22050, 256],
       ["googletts", "hifigan16k", 16000, 320],
+      ["googletts-bigvgan", "bigvgan22k", 22050, 256],
     ]);
+  });
+  test("keeps each voice's language", () => {
+    expect(parseManifest(manifest()).decoders.map((d) => d.language)).toEqual(["sv", "sv", "en", "en"]);
+  });
+  test("voices from before languages: googletts is English, the narrator Swedish", () => {
+    const m = manifest();
+    for (const d of m.decoders) delete (d as Partial<typeof d>).language;
+    expect(parseManifest(m).decoders.map((d) => d.language)).toEqual(["sv", "sv", "en", "en"]);
   });
   test("voices without vocoder settings are HiFi-GAN 16 kHz, as before BigVGAN", () => {
     const m = { ...manifest(), decoders: [entry("googletts")] };
@@ -52,6 +62,21 @@ describe("parseManifest", () => {
   });
 });
 
+describe("choosing a voice by language", () => {
+  test("lists the languages in models.json order", () => {
+    expect(languages(manifest())).toEqual(["sv", "en"]);
+  });
+  test("keeps the vocoder when the other language has it", () => {
+    expect(voiceForLanguage(manifest(), "en", "bigvgan22k")).toBe("googletts-bigvgan");
+    expect(voiceForLanguage(manifest(), "sv", "hifigan16k")).toBe("sv-narrator");
+  });
+  test("else takes the language's first voice", () => {
+    const m = manifest();
+    m.decoders = m.decoders.filter((d) => d.id !== "googletts-bigvgan");
+    expect(voiceForLanguage(m, "en", "bigvgan22k")).toBe("googletts");
+  });
+});
+
 test("fileUrl resolves against the base and adds a version", () => {
   expect(fileUrl("http://x/app/models/", file("e.onnx"))).toBe(`http://x/app/models/e.onnx?v=${"ab".repeat(8)}`);
 });
@@ -71,5 +96,5 @@ test("the Swedish narrator is the default voice when present", () => {
   m.decoders.reverse();
   expect(defaultDecoder(m)).toBe("sv-narrator");
   m.decoders = m.decoders.filter((d) => d.id !== "sv-narrator");
-  expect(defaultDecoder(m)).toBe("googletts"); // otherwise the first one
+  expect(defaultDecoder(m)).toBe("googletts-bigvgan"); // otherwise the first one
 });

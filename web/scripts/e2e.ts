@@ -1,11 +1,12 @@
 // End-to-end test: runs the app in Google Chrome with a fake microphone that plays
 // sample_whisper.wav, and checks every path a person would use.
-//   - The Swedish encoder, the Swedish narrator voice and WebGPU are the defaults.
-//   - Push-to-talk works with the mouse and with Space, and converts with both encoders.
-//   - Comparing voices converts with every encoder and voice in models.json, each voice at its
-//     own sample rate (BigVGAN's 22.05 kHz too), on WASM and WebGPU, and the voices differ.
+//   - The Swedish encoder, the Swedish narrator voice and WebGPU are the defaults; comparing is off.
+//   - Push-to-talk works with the mouse and with Space, and converts with the selected encoder and voice.
 //   - An uploaded file converts too, and "Run again" works after switching to WASM.
-//   - WebGPU and WASM agree, and the two encoders give different results.
+//   - Comparing lists the other encoder and voices with each take, unconverted (and not downloaded)
+//     until Generate; then they convert and play. The two encoders give different results.
+//   - Every voice in models.json can be chosen by language and output model, and converts at its
+//     own sample rate (BigVGAN's 22.05 kHz too), on WASM and WebGPU, which agree; the voices differ.
 //   - Old downloads are cleaned up, and a private window says it can't keep the models.
 //
 //   bun run test:e2e            # against the dev server (needs the models: see README.md)
@@ -41,6 +42,8 @@ if (!existsSync(join(MODELS_DIR, "models.json"))) {
 }
 interface VoiceInfo {
   id: string;
+  language: string;
+  vocoder: string;
   sampleRate?: number;
   hop?: number;
 }
@@ -194,7 +197,7 @@ async function waitForOutputs(page: Page, takeId: number, count: number) {
   await page.waitForFunction(
     ([takeId, count]) => {
       const t = (window as any).__wesper.takes.find((t: any) => t.id === takeId);
-      return t && t.outputs.length >= count && t.outputs.every((o: any) => o.status === "done" || o.status === "error");
+      return t && t.outputs.length >= count && t.outputs.every((o: any) => !["queued", "running"].includes(o.status));
     },
     [takeId, count],
     { timeout: STEP_MS, polling: 200 },
@@ -232,7 +235,37 @@ function outputLength(voice: string, n: number) {
   return Math.floor((units * 320 * rate) / (16000 * hop)) * hop;
 }
 
-function checkTake(t: TakeInfo, backend: string, from = 0, pairs = ["sv:sv-narrator", "original:sv-narrator"]) {
+/** Waits for output index of the take to finish (after Generate). */
+async function waitForOutput(page: Page, takeId: number, index: number) {
+  await page.waitForFunction(
+    ([takeId, index]) => {
+      const o = (window as any).__wesper.takes.find((t: any) => t.id === takeId)?.outputs[index];
+      return o && (o.status === "done" || o.status === "error");
+    },
+    [takeId, index],
+    { timeout: STEP_MS, polling: 200 },
+  );
+  return (await takes(page)).find((t) => t.id === takeId)!;
+}
+
+const LANGUAGE_NAMES: Record<string, string> = { sv: "Swedish", en: "English" };
+const VOCODER_NAMES: Record<string, string> = { hifigan16k: "HiFi-GAN", bigvgan22k: "BigVGAN" };
+
+/** Chooses a voice as a person would: its language, then its output model. */
+async function chooseVoice(page: Page, v: VoiceInfo) {
+  const [language, model] = [LANGUAGE_NAMES[v.language], VOCODER_NAMES[v.vocoder]];
+  await page.getByRole("radiogroup", { name: "Language" }).getByRole("radio", { name: language }).click();
+  const models = page.getByRole("radiogroup", { name: "Output model" }).getByRole("radio");
+  const offered = (await models.allTextContents()).map((s) => s.trim());
+  const expected = VOICES.filter((d) => d.language === v.language).map((d) => VOCODER_NAMES[d.vocoder]);
+  check(offered.length === expected.length && expected.every((n, i) => offered[i].startsWith(n)),
+        `${language} offers ${expected.join(" and ")} (${offered.join(", ")})`);
+  await models.filter({ hasText: model }).click();
+  const chosen: string = await page.evaluate(() => (window as any).__wesper.settings.decoder);
+  check(chosen === v.id, `${language}, ${model}: the ${v.id} voice`);
+}
+
+function checkTake(t: TakeInfo, backend: string, from = 0, pairs = ["sv:sv-narrator"]) {
   const outs = t.outputs.slice(from);
   const got = outs.map((o) => `${o.encoder}:${o.decoder}`);
   check(got.join() === pairs.join(), `take ${t.id}: converted as ${pairs.join(", then ")} (${got})`);
@@ -274,10 +307,10 @@ try {
   const state = await page.evaluate(() => {
     const app = (window as any).__wesper;
     return { encoder: app.settings.encoder, decoder: app.settings.decoder, compare: app.settings.compare,
-             compareVoices: app.settings.compareVoices, ...app.resolved, isolated: crossOriginIsolated, threads: app.caps.threads };
+             ...app.resolved, isolated: crossOriginIsolated, threads: app.caps.threads };
   });
-  check(state.encoder === "sv" && state.compare, `Swedish encoder selected, compare on`);
-  check(state.decoder === "sv-narrator" && !state.compareVoices, `Swedish narrator voice selected, voice compare off`);
+  check(state.encoder === "sv" && !state.compare, `Swedish encoder selected, comparing off`);
+  check(state.decoder === "sv-narrator", `Swedish narrator voice selected`);
   check(state.backend === "webgpu", `WebGPU by default (${state.backend})`);
   check(state.isolated && state.threads > 1, `cross-origin isolated, ${state.threads} WASM threads`);
 
@@ -292,7 +325,7 @@ try {
     return app.playing !== null && app.playing === app.takes[0]?.outputs[0]?.key;
   }, null, { timeout: STEP_MS, polling: 50 });
   check(true, "take 1: the Swedish result plays as soon as it's ready");
-  let t = await waitForOutputs(page, 1, 2);
+  let t = await waitForOutputs(page, 1, 1);
   check(t.samples > 1.5 * 16000 && t.samples < 4 * 16000, `take 1: ${(t.samples / 16000).toFixed(2)} s recorded`);
   check(t.levelDbfs > -60, `take 1: the fake microphone was heard (${t.levelDbfs.toFixed(1)} dBFS)`);
   checkTake(t, "webgpu");
@@ -301,31 +334,55 @@ try {
   await page.keyboard.down("Space");
   await page.waitForTimeout(1500);
   await page.keyboard.up("Space");
-  t = await waitForOutputs(page, 2, 2);
+  t = await waitForOutputs(page, 2, 1);
   check(t.samples > 1.0 * 16000 && t.samples < 3 * 16000, `take 2: ${(t.samples / 16000).toFixed(2)} s recorded`);
   checkTake(t, "webgpu");
 
   console.log("file upload, then WASM");
   await page.getByTestId("file").setInputFiles(SAMPLE);
-  t = await waitForOutputs(page, 3, 2);
+  t = await waitForOutputs(page, 3, 1);
   check(t.samples === SAMPLE_LENGTH, `take 3: the whole file (${t.samples} of ${SAMPLE_LENGTH} samples)`);
   checkTake(t, "webgpu");
 
   await page.getByRole("radio", { name: /^WASM/ }).click();
   await waitForReady(page);
   await page.locator('[data-take="3"]').getByRole("button", { name: "Run again" }).click();
-  t = await waitForOutputs(page, 3, 4);
-  checkTake(t, "wasm", 2);
+  t = await waitForOutputs(page, 3, 2);
+  checkTake(t, "wasm", 1);
 
-  const gpuVsWasm = await snr(page, 3, 0, 2);
+  const gpuVsWasm = await snr(page, 3, 0, 1);
   check(gpuVsWasm > 50, `WebGPU and WASM agree (Swedish: ${gpuVsWasm.toFixed(1)} dB SNR)`);
-  const encoders = await snr(page, 3, 0, 1);
+
+  console.log("comparing with the other options, generated on request");
+  check((await page.getByLabel(/voice, to compare/).count()) === 0, "there's one comparison checkbox, not one per kind");
+  await page.getByLabel(/Compare with the other options/).check();
+  await page.locator('[data-take="3"]').getByRole("button", { name: "Run again" }).click();
+  const others = ["original:sv-narrator", ...VOICES.filter((v) => v.id !== "sv-narrator").map((v) => `sv:${v.id}`)];
+  t = await waitForOutputs(page, 3, 3 + others.length);
+  checkTake({ ...t, outputs: t.outputs.slice(0, 3) }, "wasm", 2);
+  const listed = t.outputs.slice(3);
+  check(listed.map((o) => `${o.encoder}:${o.decoder}`).join() === others.join(),
+        `the other options are listed: ${others.join(", ")}`);
+  check(listed.every((o) => o.status === "idle" && o.samples === 0), "they aren't converted yet");
+  const generate = page.locator('[data-take="3"]').getByRole("button", { name: /^Generate/ });
+  check((await generate.count()) === others.length, `each has a Generate button (${await generate.count()})`);
+  await page.locator('[data-take="3"] [data-encoder="original"][data-decoder="sv-narrator"]').getByRole("button", { name: /^Generate/ }).click();
+  t = await waitForOutput(page, 3, 3);
+  checkTake({ ...t, outputs: t.outputs.slice(0, 4) }, "wasm", 3, ["original:sv-narrator"]);
+  await page.waitForFunction(() => {
+    const app = (window as any).__wesper;
+    return app.playing === app.takes[0].outputs[3].key;
+  }, null, { timeout: 30_000, polling: 50 });
+  check(true, "a generated option plays when it's ready");
+  check(t.outputs.slice(4).every((o) => o.status === "idle"), "the others stay unconverted");
+  const encoders = await snr(page, 3, 2, 3);
   check(encoders < 20, `the two encoders give different audio (${encoders.toFixed(1)} dB SNR)`);
+  await page.getByLabel(/Compare with the other options/).uncheck();
 
   console.log("persistence and cache cleanup");
   const cached = () => page.evaluate(async () => (await (await caches.open("wesper-models-v1")).keys()).map((r) => new URL(r.url).pathname));
   const before = await cached();
-  check(before.length === 3, `the three models are cached (${before.join(", ")})`);
+  check(before.length === 3, `only the three models used are cached, not the voices left unconverted (${before.join(", ")})`);
   await page.evaluate(() => caches.open("wesper-models-v1").then((c) => c.put("/models/encoder-sv.fp16.onnx?v=old", new Response("old"))));
   await page.reload();
   await waitForReady(page);
@@ -337,30 +394,38 @@ try {
   );
   check((await cached()).sort().join() === before.sort().join(), "a download no longer in models.json is deleted, the models stay");
 
-  console.log(`comparing voices: ${VOICES.map((v) => v.id).join(", ")}`);
-  await page.getByLabel(/Also convert with the .* voice/).check();
-  await waitForReady(page);
+  const order = [VOICES.find((v) => v.id === "sv-narrator")!, ...VOICES.filter((v) => v.id !== "sv-narrator")];
+  console.log(`every voice, by language and output model: ${order.map((v) => v.id).join(", ")}`);
   await page.getByTestId("file").setInputFiles(SAMPLE); // the reload above cleared the takes: a new one
   await page.waitForFunction(() => (window as any).__wesper.takes.length > 0, null, { timeout: STEP_MS });
   const voiceTake: number = await page.evaluate(() => (window as any).__wesper.takes[0].id);
-  const voiceOrder = ["sv-narrator", ...VOICES.map((v) => v.id).filter((id) => id !== "sv-narrator")];
-  const voicePairs = ["sv", "original"].flatMap((e) => voiceOrder.map((d) => `${e}:${d}`));
-  t = await waitForOutputs(page, voiceTake, voicePairs.length);
+  t = await waitForOutputs(page, voiceTake, 1);
+  for (const [i, v] of order.entries()) {
+    if (i === 0) continue; // converted with the default voice already
+    await chooseVoice(page, v);
+    await waitForReady(page);
+    await page.locator(`[data-take="${voiceTake}"]`).getByRole("button", { name: "Run again" }).click();
+    t = await waitForOutputs(page, voiceTake, i + 1);
+  }
+  const voicePairs = order.map((v) => `sv:${v.id}`);
   checkTake(t, "wasm", 0, voicePairs);
-  for (let i = 1; i < voiceOrder.length; i++) {
+  for (let i = 1; i < order.length; i++) {
     if (t.outputs[i].samples !== t.outputs[0].samples) continue; // another sample rate: different anyway
     const voices = await snr(page, voiceTake, 0, i);
-    check(voices < 20, `the ${voiceOrder[0]} and ${voiceOrder[i]} voices give different audio (${voices.toFixed(1)} dB SNR)`);
+    check(voices < 20, `the ${order[0].id} and ${order[i].id} voices give different audio (${voices.toFixed(1)} dB SNR)`);
   }
 
-  console.log("comparing voices on WebGPU");
+  console.log("every voice on WebGPU");
   await page.getByRole("radio", { name: /^WebGPU/ }).click();
-  await waitForReady(page);
-  await page.locator(`[data-take="${voiceTake}"]`).getByRole("button", { name: "Run again" }).click();
-  t = await waitForOutputs(page, voiceTake, 2 * voicePairs.length);
-  checkTake(t, "webgpu", voicePairs.length, voicePairs);
-  for (let i = 0; i < voiceOrder.length; i++) {
-    const agree = await snr(page, voiceTake, i, voicePairs.length + i);
+  for (const [i, v] of order.entries()) {
+    await chooseVoice(page, v);
+    await waitForReady(page);
+    await page.locator(`[data-take="${voiceTake}"]`).getByRole("button", { name: "Run again" }).click();
+    t = await waitForOutputs(page, voiceTake, order.length + i + 1);
+  }
+  checkTake(t, "webgpu", order.length, voicePairs);
+  for (let i = 0; i < order.length; i++) {
+    const agree = await snr(page, voiceTake, i, order.length + i);
     check(agree > 50, `WebGPU and WASM agree (${voicePairs[i]}: ${agree.toFixed(1)} dB SNR)`);
   }
 

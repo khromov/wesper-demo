@@ -168,11 +168,36 @@ class AgainstCheckpoints(unittest.TestCase):
         wav = em.DecoderExport(self.fs2, self.vocoder).eval()(self.units)[0]
         torch.testing.assert_close(wav, em.reference_wav(self.fs2, self.vocoder, self.units), atol=1e-5, rtol=0)
 
+    def test_mel_mapped_decoder_is_bigvgan_previews_mel(self):
+        """The English voice through BigVGAN: the HiFi-GAN decoder's mel moved to BigVGAN's frames and
+        corrected per band, as decoder/bigvgan_preview.py does. An identity vocoder shows the mel itself."""
+        mel_map = em.load_mel_map(em.MEL_MAP)
+        mel = em.DecoderExport(self.fs2, nn.Identity(), BIGVGAN22K, mel_map).eval()(self.units)[0]
+        ref = em.reference_wav(self.fs2, nn.Identity(), self.units, BIGVGAN22K, mel_map)
+        self.assertEqual(mel.shape, (80, em.vocoders.n_frames(self.units.shape[1], BIGVGAN22K)))
+        torch.testing.assert_close(mel, ref, atol=1e-4, rtol=0)
+        unmapped = em.DecoderExport(self.fs2, nn.Identity()).eval()(self.units)[0]
+        self.assertGreater((mel.mean() - unmapped.mean()).abs().item(), 0.01)  # the correction did something
+
     def test_decoder_wrapper_beyond_the_original_position_table(self):
         units = self.units.repeat(1, 12, 1)  # 1104 frames: past FastSpeech2's 1000-frame table
         self.assertGreater(units.shape[1], 1000)
         wav = em.DecoderExport(self.fs2, self.vocoder).eval()(units)[0]
         torch.testing.assert_close(wav, em.reference_wav(self.fs2, self.vocoder, units), atol=1e-5, rtol=0)
+
+
+class MelMap(unittest.TestCase):
+    def test_the_committed_map_has_a_line_per_band(self):
+        a, c = em.load_mel_map(em.MEL_MAP)
+        self.assertEqual((a.shape, c.shape), ((80,), (80,)))
+        self.assertTrue(((a > 0.5) & (a < 2)).all())  # close to a level shift, as fitted
+
+    def test_rejects_a_map_for_other_vocoders(self):
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
+            json.dump({"from": "hifigan16k", "to": "bigvgan:other", "a": [1.0], "c": [0.0]}, f)
+        self.addCleanup(os.remove, f.name)
+        with self.assertRaises(SystemExit):
+            em.load_mel_map(f.name)
 
 
 class RunConfigs(unittest.TestCase):
@@ -280,6 +305,39 @@ class BigVGANDecoder(unittest.TestCase):
         self.assertGreater(info["bytes"], 400e6)
 
 
+@unittest.skipUnless(WITH_BIGVGAN, "set WESPER_BIGVGAN=1 to run BigVGAN (and have its checkpoint cached)")
+@unittest.skipUnless(all(os.path.exists(p) for p in CACHED), "WESPER's checkpoints aren't cached yet")
+class MappedEnglishBigVGAN(unittest.TestCase):
+    """WESPER's English decoder (trained for HiFi-GAN) through BigVGAN, with the mel map, against bigvgan_preview.py's path."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.TemporaryDirectory()
+        cls.voc = em.vocoders.spec("bigvgan22k")
+        cls.fs2 = em.wn.load_fastspeech2(em.load_configs(), checkpoint_path=CACHED[1], device="cpu")
+        cls.vocoder = em.vocoders.load(cls.voc)
+        em.fixed_bigvgan_filters(cls.vocoder, cls.voc.n_mels)
+        cls.mel_map = em.load_mel_map(em.MEL_MAP)
+        wav, _ = sf.read(os.path.join(REPO, "sample_whisper.wav"), dtype="float32")
+        cls.units = em.reference_units(em.wn.load_hubert(CACHED[0], device="cpu"), wav)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.tmp.cleanup()
+
+    def test_plays_at_bigvgans_rate(self):
+        ref = em.reference_wav(self.fs2, self.vocoder, self.units, self.voc, self.mel_map)
+        self.assertEqual(len(ref), em.vocoders.n_frames(self.units.shape[1], self.voc) * self.voc.hop)
+
+    def test_onnx_export_matches_reference(self):
+        # export_decoder checks the file against reference_wav on each input, and raises if they disagree
+        units = [self.units.numpy(), self.units[:, :57].numpy()]
+        info, checks = em.export_decoder(self.fs2, self.vocoder, "test", self.tmp.name, units, lambda s: None, self.voc,
+                                         self.mel_map)
+        self.assertEqual(len(checks), 2)
+        self.assertGreater(info["bytes"], 400e6)
+
+
 @unittest.skipUnless(os.environ.get("WESPER_EXPORT_SMOKE"), "set WESPER_EXPORT_SMOKE=1 to run the full export")
 @unittest.skipUnless(all(os.path.exists(p) for p in CACHED), "WESPER's checkpoints aren't cached yet")
 class ExportSmoke(unittest.TestCase):
@@ -294,6 +352,8 @@ class ExportSmoke(unittest.TestCase):
             if not bigvgan_run and WITH_BIGVGAN and has_sv_decoder:
                 bigvgan_run = stand_in_bigvgan_run(os.path.join(runs, "run"))
             args += ["--sv-bigvgan-decoder", bigvgan_run or ""]
+            if not WITH_BIGVGAN:
+                args += ["--en-bigvgan-map", ""]
             r = subprocess.run(args, capture_output=True, text=True, timeout=1600, cwd=tempfile.gettempdir())
             self.assertEqual(r.returncode, 0, r.stdout[-3000:] + r.stderr[-3000:])
 
@@ -304,11 +364,13 @@ class ExportSmoke(unittest.TestCase):
             self.assertEqual((original["targetDbfs"], original["maxGainDb"]), (None, None))
             if has_sv:
                 self.assertEqual((manifest["encoders"][0]["targetDbfs"], manifest["encoders"][0]["maxGainDb"]), (-20.0, 40.0))
-            expected = ["sv-narrator"] * has_sv_decoder + ["sv-narrator-bigvgan"] * bool(bigvgan_run) + ["googletts"]
+            expected = (["sv-narrator"] * has_sv_decoder + ["sv-narrator-bigvgan"] * bool(bigvgan_run) + ["googletts"]
+                        + ["googletts-bigvgan"] * WITH_BIGVGAN)
             self.assertEqual([d["id"] for d in manifest["decoders"]], expected)
             for d in manifest["decoders"]:
                 self.assertEqual((d["vocoder"], d["sampleRate"], d["hop"]),
-                                 ("bigvgan22k", 22050, 256) if d["id"] == "sv-narrator-bigvgan" else ("hifigan16k", 16000, 320))
+                                 ("bigvgan22k", 22050, 256) if d["id"].endswith("-bigvgan") else ("hifigan16k", 16000, 320))
+                self.assertEqual(d["language"], "en" if d["id"].startswith("googletts") else "sv")
             self.assertEqual(sorted(f for f in os.listdir(out) if f.endswith(".onnx")),
                              sorted([f"encoder-{e['id']}.onnx" for e in manifest["encoders"]] +
                                     [f"decoder-{d['id']}.onnx" for d in manifest["decoders"]]))

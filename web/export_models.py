@@ -8,10 +8,14 @@ Writes into web/public/models/ (by default):
 The models stay fp32: fp16 versions were tried and sounded clearly worse in the browser.
 
 Encoders: WESPER's original, and the Swedish fine-tuned one if its checkpoint exists. Decoders
-(voices): the Swedish narrator trained by decoder/train.py, for HiFi-GAN and for BigVGAN, if their
-run folders exist, and WESPER's English googletts one. A voice plays at its vocoder's sample rate
-(16 kHz for HiFi-GAN, 22.05 kHz for BigVGAN-22k; in models.json). Every exported file is checked
-against the PyTorch code path that convert.py and the GUI use; the script fails if they disagree.
+(voices), each with its language and vocoder in models.json: the Swedish narrator trained by
+decoder/train.py, for HiFi-GAN and for BigVGAN, if their run folders exist, and WESPER's English
+googletts one, with HiFi-GAN and with BigVGAN. The English decoder was trained for HiFi-GAN only,
+so its BigVGAN version converts its mels to approximate BigVGAN ones on the way, as
+decoder/bigvgan_preview.py does, with the fitted correction in decoder/mel_map_hifigan16k_to_bigvgan22k.json.
+A voice plays at its vocoder's sample rate (16 kHz for HiFi-GAN, 22.05 kHz for BigVGAN-22k). Every
+exported file is checked against the PyTorch code path that convert.py and the GUI use (for the
+mapped English voice, bigvgan_preview.py's); the script fails if they disagree.
 
     .venv/bin/python web/export_models.py               # needs: pip install -r web/requirements-export.txt
 
@@ -48,12 +52,14 @@ sys.path.insert(0, REPO)
 sys.path.insert(0, os.path.join(REPO, "libs", "FastSpeech2"))
 import vocoders  # noqa: E402
 import whisper_normal as wn  # noqa: E402
+from decoder import bigvgan_preview  # noqa: E402
 from transformer.Models import get_sinusoid_encoding_table  # noqa: E402
 
 RELEASE = "https://github.com/rkmt/wesper-demo/releases/download/v0.1"
 SR, HOP = 16000, 320
 MAX_SECONDS = 120  # longest input the decoder's position table covers
 OPSET = 17
+MEL_MAP = os.path.join(REPO, "decoder", "mel_map_hifigan16k_to_bigvgan22k.json")
 
 
 # ---------------------------------------------------------------- export wrappers
@@ -161,15 +167,22 @@ def fixed_bigvgan_filters(vocoder, n_mels):
 class DecoderExport(nn.Module):
     """soft units [1, N, 256] -> wav [1, S]: FastSpeech2's inference path as units2wav() runs it
     (no targets: predicted pitch, energy and durations), then the vocoder (voc). Batch 1, no
-    padding. For vocoders with other frame rates, the units are first moved to its frames."""
+    padding. For vocoders with other frame rates, the units are first moved to its frames.
 
-    def __init__(self, fs2, vocoder, voc=vocoders.HIFIGAN16K):
+    With mel_map (a, c per band), the decoder was trained for HiFi-GAN but voc is BigVGAN: it runs
+    at HiFi-GAN's frames, and its mel is moved to voc's frames and corrected, a * mel + c, as
+    decoder/bigvgan_preview.py does."""
+
+    def __init__(self, fs2, vocoder, voc=vocoders.HIFIGAN16K, mel_map=None):
         super().__init__()
         assert isinstance(fs2.encoder.src_word_emb, nn.Identity), "expects 256-dim soft units (soft_unit_dim 256)"
-        self.fs2, self.vocoder, self.voc = fs2, vocoder, voc
+        self.fs2, self.vocoder, self.voc, self.mapped = fs2, vocoder, voc, mel_map is not None
         d = fs2.encoder.d_model
-        frames = vocoders.n_frames(MAX_SECONDS * SR // HOP, voc)
+        frames = vocoders.n_frames(MAX_SECONDS * SR // HOP, vocoders.HIFIGAN16K if self.mapped else voc)
         self.register_buffer("pos", get_sinusoid_encoding_table(frames + 1, d)[None])
+        if self.mapped:
+            self.register_buffer("map_a", torch.as_tensor(np.asarray(mel_map[0]), dtype=torch.float32))
+            self.register_buffer("map_c", torch.as_tensor(np.asarray(mel_map[1]), dtype=torch.float32))
 
     def fft(self, layers, x):
         mask = torch.zeros_like(x[:, :, 0], dtype=torch.bool)
@@ -180,7 +193,7 @@ class DecoderExport(nn.Module):
         return x
 
     def forward(self, units):
-        if not self.voc.one_frame_per_unit:
+        if not self.voc.one_frame_per_unit and not self.mapped:
             units = units_to_frames(units, self.voc)
         va = self.fs2.variance_adaptor
         x = self.fft(self.fs2.encoder.layer_stack, units)
@@ -192,6 +205,8 @@ class DecoderExport(nn.Module):
         x = self.fft(self.fs2.decoder.layer_stack, regulate_length(x, durations))
         mel = self.fs2.mel_linear(x)
         mel = self.fs2.postnet(mel) + mel
+        if self.mapped:  # a HiFi-GAN mel, at the vocoder's frames, each band's level corrected
+            mel = units_to_frames(mel, self.voc) * self.map_a + self.map_c
         return self.vocoder(mel.transpose(1, 2)).squeeze(1)
 
 
@@ -201,8 +216,16 @@ def reference_units(hubert, wav):
     return wn.wav2units(torch.tensor(wav, dtype=torch.float32)[None], hubert, device="cpu")
 
 
-def reference_wav(fs2, vocoder, units, voc=vocoders.HIFIGAN16K):
-    """units2wav() without its int16 conversion."""
+def reference_wav(fs2, vocoder, units, voc=vocoders.HIFIGAN16K, mel_map=None):
+    """units2wav() without its int16 conversion. With mel_map: decoder/bigvgan_preview.py's path
+    for a decoder trained for HiFi-GAN, through the BigVGAN vocoder (voc)."""
+    if mel_map is not None:
+        n = units.shape[1]
+        out = fs2(torch.tensor([0]), units, torch.tensor([n]), n)
+        mel16 = out[1][0, : out[9][0].item()].T.numpy()
+        mel = bigvgan_preview.apply_band_map(
+            bigvgan_preview.to_frames(mel16, voc, vocoders.n_frames(mel16.shape[1], voc)), *mel_map)
+        return vocoder(torch.from_numpy(mel)[None]).squeeze(1)[0]
     if not voc.one_frame_per_unit:
         units = torch.from_numpy(vocoders.units_to_frames(units[0].numpy(), vocoders.n_frames(units.shape[1], voc), voc))[None]
     n = units.shape[1]
@@ -293,21 +316,35 @@ def export_encoder(hubert, eid, out, clips, log):
     return info, checks
 
 
-def export_decoder(fs2, vocoder, did, out, units_list, log, voc=vocoders.HIFIGAN16K):
-    refs = [reference_wav(fs2, vocoder, torch.tensor(u), voc).numpy() for u in units_list]
+def export_decoder(fs2, vocoder, did, out, units_list, log, voc=vocoders.HIFIGAN16K, mel_map=None):
+    refs = [reference_wav(fs2, vocoder, torch.tensor(u), voc, mel_map).numpy() for u in units_list]
     path = os.path.join(out, f"decoder-{did}.onnx")
-    export(DecoderExport(fs2, vocoder, voc).eval(), torch.tensor(units_list[0]), path, "units", "wav", ("frames", "samples"))
+    export(DecoderExport(fs2, vocoder, voc, mel_map).eval(), torch.tensor(units_list[0]), path, "units", "wav", ("frames", "samples"))
     checks = [check_decoder(path, u, r) for u, r in zip(units_list, refs)]
     info = file_info(path)
     log(f"  {info['path']}: {info['bytes'] / 1e6:.0f} MB, {checks}")
     return info, checks
 
 
-DECODERS = {  # id -> label, description, vocoder; the first one found is the app's default
-    "sv-narrator": ("Swedish narrator", "A Swedish voice: WESPER's decoder fine-tuned on 14 h of one audiobook narrator (decoder/), with HiFi-GAN 16 kHz", "hifigan16k"),
-    "sv-narrator-bigvgan": ("Swedish narrator (BigVGAN)", "The same narrator, trained for NVIDIA's BigVGAN v2 vocoder: 22.05 kHz and clearer, but a 600 MB download, and slow without WebGPU", "bigvgan22k"),
-    "googletts": ("English", "WESPER's English voice trained on Google TTS output, with HiFi-GAN 16 kHz", "hifigan16k"),
+DECODERS = {  # id -> what the app shows (language, label, description) and the vocoder; in this order
+    "sv-narrator": dict(language="sv", label="Swedish narrator", vocoder="hifigan16k",
+                        description="A Swedish voice: WESPER's decoder fine-tuned on 14 h of one audiobook narrator (decoder/), with HiFi-GAN 16 kHz"),
+    "sv-narrator-bigvgan": dict(language="sv", label="Swedish narrator (BigVGAN)", vocoder="bigvgan22k",
+                                description="The same narrator, trained for NVIDIA's BigVGAN v2 vocoder: 22.05 kHz and clearer, but a 600 MB download, and slow without WebGPU"),
+    "googletts": dict(language="en", label="English", vocoder="hifigan16k",
+                      description="WESPER's English voice trained on Google TTS output, with HiFi-GAN 16 kHz"),
+    "googletts-bigvgan": dict(language="en", label="English (BigVGAN)", vocoder="bigvgan22k",
+                              description="WESPER's English voice through NVIDIA's BigVGAN v2 vocoder, 22.05 kHz. Its decoder was trained for HiFi-GAN, so its spectrograms are converted to BigVGAN's on the way: clearer than HiFi-GAN, though a little blurred next to a voice trained for BigVGAN. A 600 MB download, and slow without WebGPU"),
 }
+
+
+def load_mel_map(path):
+    """(a, c): the per-band correction from a HiFi-GAN mel to an approximate BigVGAN-22k mel (bigvgan_preview.py fit)."""
+    with open(path) as f:
+        m = json.load(f)
+    if (m.get("from"), m.get("to")) != ("hifigan16k", "bigvgan22k") or len(m["a"]) != len(m["c"]):
+        raise SystemExit(f"{path} isn't a hifigan16k -> bigvgan22k mel map")
+    return np.array(m["a"], np.float32), np.array(m["c"], np.float32)
 
 
 def load_run_configs(run, model_config):
@@ -339,6 +376,8 @@ def main(argv=None):
                    help="Swedish decoder run folder (decoder_best.pt, preprocess.yaml, stats.json); skipped if missing, or if set to ''")
     p.add_argument("--sv-bigvgan-decoder", default=os.path.join(REPO, "decoder", "runs", "sv-narrator-bigvgan22k"),
                    help="the same for the Swedish decoder trained for BigVGAN; skipped if missing, or if set to ''")
+    p.add_argument("--en-bigvgan-map", default=MEL_MAP,
+                   help="mel map for the English voice through BigVGAN (bigvgan_preview.py fit); skipped if set to ''")
     p.add_argument("--fastspeech2", default=f"{RELEASE}/googletts_neutral_best.tar")
     p.add_argument("--hifigan", default=f"{RELEASE}/g_00205000")
     p.add_argument("--timeout", type=float, default=1800, help="seconds before a hung export is aborted")
@@ -397,25 +436,33 @@ def main(argv=None):
         for did, folder in (("sv-narrator", args.sv_decoder), ("sv-narrator-bigvgan", args.sv_bigvgan_decoder)):
             run = folder and os.path.abspath(folder)
             if not (run and os.path.exists(os.path.join(run, "decoder_best.pt"))):
-                log(f"### skipping the {DECODERS[did][0]} decoder: no decoder_best.pt in {folder!r}")
+                log(f"### skipping the {DECODERS[did]['label']} decoder: no decoder_best.pt in {folder!r}")
                 continue
             cfg = load_run_configs(run, configs[1])
             voc = run_vocoder(cfg[0])
-            if voc.name != DECODERS[did][2]:
-                raise SystemExit(f"{run} was trained for {voc.name}, but the {DECODERS[did][0]} voice is for {DECODERS[did][2]}")
-            decoders.append((did, cfg, os.path.join(run, "decoder_best.pt"), voc, vocoders.run_checkpoint(cfg[0], run)))
-        decoders.append(("googletts", configs, args.fastspeech2, vocoders.HIFIGAN16K, None))
+            if voc.name != DECODERS[did]["vocoder"]:
+                raise SystemExit(f"{run} was trained for {voc.name}, but the {DECODERS[did]['label']} voice is for {DECODERS[did]['vocoder']}")
+            decoders.append((did, cfg, os.path.join(run, "decoder_best.pt"), voc, vocoders.run_checkpoint(cfg[0], run), None))
+        decoders.append(("googletts", configs, args.fastspeech2, vocoders.HIFIGAN16K, None, None))
+        if args.en_bigvgan_map:
+            decoders.append(("googletts-bigvgan", configs, args.fastspeech2, vocoders.spec("bigvgan22k"), None,
+                             load_mel_map(args.en_bigvgan_map)))
+        else:
+            log(f"### skipping the {DECODERS['googletts-bigvgan']['label']} decoder: no --en-bigvgan-map")
         decoders.sort(key=lambda d: list(DECODERS).index(d[0]))
-        for did, cfg, checkpoint, voc, voc_checkpoint in decoders:
+        for did, cfg, checkpoint, voc, voc_checkpoint, mel_map in decoders:
             source = [checkpoint if checkpoint.startswith("http") else os.path.relpath(checkpoint, REPO),
                       os.path.relpath(voc_checkpoint, REPO) if voc_checkpoint
                       else args.hifigan if voc.name == "hifigan16k" else voc.checkpoint]
-            log(f"### decoder {did}: {source[0]} + {voc.name}")
+            if mel_map is not None:
+                source.append(os.path.relpath(os.path.abspath(args.en_bigvgan_map), REPO))
+            log(f"### decoder {did}: {source[0]} + {voc.name}" + (" (mel map)" if mel_map is not None else ""))
             fs2 = wn.load_fastspeech2(cfg, checkpoint_path=checkpoint, device="cpu")
-            info, checks = export_decoder(fs2, vocoder_for(voc, voc_checkpoint), did, out, units_for_decoder, log, voc)
-            description = DECODERS[did][1] + (". Its BigVGAN is fine-tuned on this decoder's own output, which reduces"
-                                              " its electric buzz (decoder/finetune_vocoder.py)" if voc_checkpoint else "")
-            manifest["decoders"].append({"id": did, "label": DECODERS[did][0], "description": description,
+            info, checks = export_decoder(fs2, vocoder_for(voc, voc_checkpoint), did, out, units_for_decoder, log, voc, mel_map)
+            entry = DECODERS[did]
+            description = entry["description"] + (". Its BigVGAN is fine-tuned on this decoder's own output, which reduces"
+                                                   " its electric buzz (decoder/finetune_vocoder.py)" if voc_checkpoint else "")
+            manifest["decoders"].append({"id": did, "language": entry["language"], "label": entry["label"], "description": description,
                                          "vocoder": voc.name, "sampleRate": voc.sample_rate, "hop": voc.hop,
                                          "source": source, "file": info, "checks": checks})
             del fs2

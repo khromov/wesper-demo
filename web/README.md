@@ -5,13 +5,18 @@ while you whisper, then release: the recording is converted to normal speech and
 Everything runs in the page with [ONNX Runtime Web](https://onnxruntime.ai/docs/tutorials/web/),
 on WebGPU when the browser has it and WebAssembly otherwise. No audio leaves the device.
 
-- **Encoders:** Swedish (fine-tuned, the default) and the original, side by side. With *Also
-  convert with…* on, each take is converted by both, so you can A/B them with keys `1` and `2`.
-- **Voices (decoders):** the Swedish narrator (trained by `decoder/train.py`, the default),
-  the same narrator trained for BigVGAN (if that run exists), and WESPER's English voice. With
-  *Also convert with the … voice* on, each take is also converted with the other voices; it's off
-  by default, since each voice is another 200–600 MB download. Each voice plays and downloads at
-  its vocoder's sample rate: 16 kHz for HiFi-GAN, 22.05 kHz for BigVGAN.
+- **Encoders:** Swedish (fine-tuned, the default) and the original.
+- **Voices (decoders):** chosen by **Language**, then **Output model**, the vocoder: HiFi-GAN
+  16 kHz or BigVGAN 22.05 kHz. Swedish is the audiobook narrator (trained by `decoder/train.py`,
+  the default), for HiFi-GAN and, if that run exists, for BigVGAN. English is WESPER's Google TTS
+  voice, with HiFi-GAN or through BigVGAN. Its decoder was trained for HiFi-GAN only, so the
+  BigVGAN version converts its spectrograms to BigVGAN's on the way (as
+  `decoder/bigvgan_preview.py` does): clearer, but a little blurred next to a voice trained for
+  BigVGAN. Each voice plays and downloads at its vocoder's sample rate.
+- **Compare with the other options:** each take is converted with the selected encoder and voice,
+  and plays. With this on, it also lists the other encoder and the other voices, one change at a
+  time, each with a **Generate** button: nothing more is converted or downloaded until you ask
+  (BigVGAN voices are 600 MB). Generated rows play right away, and with keys `1`–`9`.
 - **Backend:** Auto (WebGPU if available), WebGPU, or WASM.
 - **Run again** converts an earlier take with the current settings, e.g. on the other backend.
 - Each result shows its timing and the gain applied to the input. Results can be downloaded as WAV.
@@ -37,9 +42,10 @@ bigvgan22k`, see HOW_TO_TRAIN_DECODER.md). It skips any of them that's missing (
 for the other vocoder. The original encoder, the English googletts decoder, HiFi-GAN and BigVGAN
 are release files (downloaded on first use; cached by torch).
 
-The models are fp32: 378 MB per encoder, 200 MB per HiFi-GAN voice and 599 MB for the BigVGAN
-voice (BigVGAN alone is 450 MB), so 956 MB with both encoders and one HiFi-GAN voice, 1.36 GB with
-the BigVGAN voice instead, and 1.76 GB with all three voices. Only the models the current settings use are downloaded.
+The models are fp32: 378 MB per encoder, 200 MB per HiFi-GAN voice and about 600 MB per BigVGAN
+voice (BigVGAN alone is 450 MB), so 2.4 GB with both encoders and all four voices. Only the models
+the current settings use are downloaded: 578 MB for the default Swedish encoder and narrator, and
+the others when a comparison row is generated.
 They're cached in the browser (Cache API) after the first download; the footer shows how much is
 stored, with a link to clear it. Private windows don't allow that much storage, so there they
 download on every visit, and the app says so. Files from earlier exports are deleted from the
@@ -54,9 +60,9 @@ for Pages, so they live elsewhere:
 
 1. Upload all the files in `web/public/models/` to one public folder (e.g. on S3):
    `models.json`, `encoder-sv.onnx`, `encoder-original.onnx`, `decoder-sv-narrator.onnx`,
-   `decoder-googletts.onnx`, and `decoder-sv-narrator-bigvgan.onnx` once the BigVGAN voice is
-   exported. After every re-export, upload them all again: `models.json` holds the other files'
-   sizes and hashes.
+   `decoder-sv-narrator-bigvgan.onnx` (once the BigVGAN narrator is exported),
+   `decoder-googletts.onnx` and `decoder-googletts-bigvgan.onnx`. They must be publicly readable.
+   After every re-export, upload `models.json` and every file whose hash in it changed.
 2. Allow the site to read them (CORS). On S3:
    ```json
    [{ "AllowedOrigins": ["https://khromov.github.io", "http://localhost:5173"],
@@ -123,7 +129,9 @@ second origin with CORS (as S3 does); it also checks that the service worker giv
 Conversion is the same as in `whisper_normal.py`: encoder (audio → 256-dim units every 20 ms),
 then FastSpeech2 and the vocoder (units → 16 kHz audio with HiFi-GAN, 22.05 kHz with BigVGAN).
 The export puts FastSpeech2 and the vocoder in one decoder file, and `models.json` gives each
-voice's vocoder, sample rate and hop. An encoder trained on level-normalized audio (the Swedish one) gets its input
+voice's vocoder, sample rate and hop. For the English voice through BigVGAN, the graph also moves the decoder's
+spectrogram to BigVGAN's frames and corrects each band's level in between, with the fit in
+`decoder/mel_map_hifigan16k_to_bigvgan22k.json`. An encoder trained on level-normalized audio (the Swedish one) gets its input
 normalized to the level it was trained on; the original gets it unchanged, as in the Python demo.
 
 ### Things that matter

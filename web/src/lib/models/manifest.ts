@@ -23,6 +23,8 @@ export interface EncoderEntry extends ModelEntry {
 }
 
 export interface DecoderEntry extends ModelEntry {
+  /** The language the voice speaks: "sv", "en", ... */
+  language: string;
   /** The vocoder in the decoder's graph (vocoders.py): "hifigan16k", "bigvgan22k", ... */
   vocoder: string;
   /** The output audio's sample rate, and its samples per mel frame. */
@@ -42,6 +44,12 @@ export interface Manifest {
 
 /** What decoders without vocoder settings use: models.json from before BigVGAN voices had none. */
 const HIFIGAN16K = { vocoder: "hifigan16k", sampleRate: 16000, hop: 320 };
+
+/** Names for the languages and vocoders the voices are chosen by. */
+export const LANGUAGE_LABELS: Record<string, string> = { sv: "Swedish", en: "English" };
+export const VOCODER_LABELS: Record<string, string> = { hifigan16k: "HiFi-GAN 16 kHz", bigvgan22k: "BigVGAN 22 kHz" };
+export const languageLabel = (language: string) => LANGUAGE_LABELS[language] ?? language;
+export const vocoderLabel = (vocoder: string) => VOCODER_LABELS[vocoder] ?? vocoder;
 
 /** The encoder selected by default: the Swedish one when it was exported. */
 export const DEFAULT_ENCODER = "sv";
@@ -73,10 +81,12 @@ export function parseManifest(json: unknown): Manifest {
   });
   m.decoders = m.decoders.map((d, i) => {
     checkEntry(d, `decoder ${i}`);
-    const v = { ...HIFIGAN16K, ...d };
+    // models.json from before voices had a language: WESPER's English one, or the Swedish narrator
+    const v = { ...HIFIGAN16K, ...d, language: (d as Partial<DecoderEntry>).language ?? (d.id.startsWith("googletts") ? "en" : "sv") };
     const positive = (x: unknown) => Number.isInteger(x) && (x as number) > 0;
     if (typeof v.vocoder !== "string" || !positive(v.sampleRate) || !positive(v.hop))
       fail(`decoder ${d.id} needs a vocoder, a sampleRate and a hop`);
+    if (typeof v.language !== "string" || !v.language) fail(`decoder ${d.id} has no language`);
     return v;
   });
   return m as Manifest;
@@ -93,4 +103,15 @@ export function defaultEncoder(m: Manifest): string {
 
 export function defaultDecoder(m: Manifest): string {
   return m.decoders.some((d) => d.id === DEFAULT_DECODER) ? DEFAULT_DECODER : m.decoders[0].id;
+}
+
+/** The voices' languages, in models.json order. */
+export function languages(m: Manifest): string[] {
+  return [...new Set(m.decoders.map((d) => d.language))];
+}
+
+/** The voice to switch to for another language: the same vocoder if it has one, else its first voice. */
+export function voiceForLanguage(m: Manifest, language: string, vocoder: string): string {
+  const voices = m.decoders.filter((d) => d.language === language);
+  return (voices.find((d) => d.vocoder === vocoder) ?? voices[0]).id;
 }
