@@ -37,22 +37,29 @@
     color: var(--muted);
   }
   .segmented {
+    flex: 1; /* as tall as the others in its row */
     display: flex;
+    flex-wrap: wrap;
     background: var(--surface-2);
     border-radius: 9px;
     padding: 3px;
     gap: 3px;
   }
   button {
-    flex: 1;
+    /* equal widths, but never narrower than the label (or the row): a long one gets more room,
+       and options that don't fit move to another row */
+    flex: 1 1 0;
+    min-width: fit-content;
     border: none;
     background: none;
     border-radius: 7px;
     padding: 6px 10px;
-    white-space: nowrap;
+    text-align: center;
+    text-wrap: balance; /* a label longer than the whole row wraps */
     display: flex;
     flex-direction: column;
     align-items: center;
+    justify-content: center;
     line-height: 1.25;
   }
   button.selected {

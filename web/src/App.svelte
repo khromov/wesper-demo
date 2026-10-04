@@ -86,12 +86,6 @@
           onchange={(encoder) => app.update({ encoder })}
         />
         <Segmented
-          label="Voice"
-          value={app.settings.decoder}
-          options={app.manifest.decoders.map((d) => ({ value: d.id, label: d.label }))}
-          onchange={(decoder) => app.update({ decoder })}
-        />
-        <Segmented
           label="Backend"
           value={app.settings.backend}
           options={[
@@ -101,6 +95,14 @@
           ]}
           onchange={(backend) => app.update({ backend })}
         />
+        <div class="wide">
+          <Segmented
+            label="Voice"
+            value={app.settings.decoder}
+            options={app.manifest.decoders.map((d) => ({ value: d.id, label: d.label }))}
+            onchange={(decoder) => app.update({ decoder })}
+          />
+        </div>
       </div>
       {#if app.encoder}
         <p class="small muted desc">
@@ -252,8 +254,11 @@
   }
   .grid {
     display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+    grid-template-columns: repeat(auto-fit, minmax(min(260px, 100%), 1fr));
     gap: 12px;
+  }
+  .wide {
+    grid-column: 1 / -1; /* the voices' labels are long, and there may be several */
   }
   .desc {
     margin: 0;
