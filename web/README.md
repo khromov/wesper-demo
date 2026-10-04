@@ -71,9 +71,12 @@ for Pages, so they live elsewhere:
 3. Point the build at the folder: `gh variable set WESPER_MODELS_URL --body https://…/folder/`.
    The workflow fails with a message until this is set.
 
-Behind a CDN (the DigitalOcean Spaces CDN is Cloudflare), purge the folder's cache after changing
-the CORS rules or re-uploading. The CDN keeps files for 7 days and ignores `Vary: Origin`, so it
-can keep serving copies without the CORS header, or `models.json` from the previous export.
+The published site uses the Space's origin endpoint (`https://sta-public.fra1.digitaloceanspaces.com/wesper-models/`),
+not its CDN, so a re-upload shows up at once. Browsers still cache the `.onnx` files: their URLs
+carry their hash. Behind a CDN instead (the DigitalOcean Spaces CDN is Cloudflare), purge the
+folder's cache after changing the CORS rules or re-uploading. The CDN keeps files for 7 days and
+ignores `Vary: Origin`, so it can keep serving copies without the CORS header, or `models.json`
+from the previous export.
 
 To try the hosted models locally: `VITE_MODELS_URL=https://…/folder/ bun run dev`.
 
