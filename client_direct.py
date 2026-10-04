@@ -15,9 +15,11 @@ import subprocess
 import datetime
 import torch
 import sounddevice as sd
+import yaml
 
 
 from direct import MyAudioClientDirect
+from whisper_normal import MyWhisper2Normal
 
 # Audio recording parameters
 RATE = 16000
@@ -25,6 +27,9 @@ FORMAT = pyaudio.paInt16
 CHUNK=1024
 CHANNELS=1
 PORT=5557
+RELEASE = "https://github.com/rkmt/wesper-demo/releases/download/v0.1"
+ENGLISH_DECODER, ENGLISH_CONFIG = f"{RELEASE}/googletts_neutral_best.tar", "config/my_preprocess16k_LJ.yaml"
+VOCODER_LABELS = {"hifigan16k": "HiFi-GAN 16 kHz", "bigvgan22k": "BigVGAN 22 kHz"}
 
 
 class MyAudioClient(object):
@@ -202,6 +207,31 @@ def select_device(kind, index):
     devices[0 if kind == "input" else 1] = index
     sd.default.device = devices
 
+def voice_choices(runs_dir):
+    """ (label, decoder checkpoint, preprocess config) of the voices to choose from: WESPER's English one, then
+        every decoder run in runs_dir (decoder/train.py or decoder/finetune_vocoder.py output), by name. """
+    voices = [("English (WESPER, HiFi-GAN 16 kHz)", ENGLISH_DECODER, ENGLISH_CONFIG)]
+    for name in sorted(os.listdir(runs_dir)) if os.path.isdir(runs_dir) else []:
+        checkpoint, config = os.path.join(runs_dir, name, "decoder_best.pt"), os.path.join(runs_dir, name, "preprocess.yaml")
+        if not (os.path.isfile(checkpoint) and os.path.isfile(config)):
+            continue
+        with open(config) as f:
+            vocoder = (yaml.safe_load(f) or {}).get("vocoder") or {}
+        label = VOCODER_LABELS.get(vocoder.get("name", "hifigan16k"), vocoder.get("name"))
+        voices.append((f"{name} ({label}{', fine-tuned vocoder' if vocoder.get('checkpoint') else ''})", checkpoint, config))
+    return voices
+
+def same_files(a, b):
+    """ Whether two (decoder checkpoint, preprocess config) pairs name the same files. """
+    return all(x == y or (not x.startswith("http") and os.path.realpath(x) == os.path.realpath(y)) for x, y in zip(a, b))
+
+def load_voice(w2n, args, fastspeech2, preprocess_config):
+    """ A converter for another decoder and its vocoder, sharing w2n's encoder and input level. """
+    voice = MyWhisper2Normal(argparse.Namespace(**{**vars(args), "fastspeech2": fastspeech2,
+                                                   "preprocess_config": preprocess_config}), load_encoder=False)
+    voice.encoder, voice.target_dbfs, voice.max_gain_db = w2n.encoder, w2n.target_dbfs, w2n.max_gain_db
+    return voice
+
 import tkinter.font
 class MyGUI(tk.Frame):
     def __init__(self, *args, **kwargs):
@@ -213,7 +243,8 @@ class MyGUI(tk.Frame):
         self.text.configure(yscrollcommand=self.vsb.set)
 
         self.button.pack(side="top")
-        self.make_device_selectors().pack(side="top", fill="x", padx=10, pady=10)
+        self.selectors = self.make_device_selectors()
+        self.selectors.pack(side="top", fill="x", padx=10, pady=10)
         self.vsb.pack(side="right", fill="y")
         self.text.pack(side="bottom", fill="x")
 
@@ -225,6 +256,7 @@ class MyGUI(tk.Frame):
 
         self.mic = MicrophoneSD() # SD Sound Device version
         #self.mic = MicrophonePA() # PA PyAudio verison 
+        self.loading = False  # a voice is loading: the button does nothing until it's ready
     
     def make_device_selectors(self):
         """ Microphone and output dropdowns. Devices plugged in later need a restart to show up. """
@@ -262,11 +294,82 @@ class MyGUI(tk.Frame):
             w2n = self.client.w2n
             level = "unchanged" if w2n.target_dbfs is None else f"normalized to {w2n.target_dbfs} dBFS speech level"
             self.log(f"encoder: {os.path.basename(args.hubert)}, input {level}")
-            self.log(f"decoder: {os.path.basename(args.fastspeech2)}, vocoder: {w2n.vocoder_spec.name} ({w2n.sample_rate} Hz)")
+            self.make_voice_selector(args)
         else:
             self.client = MyAudioClient(host=host)
 
+    def make_voice_selector(self, args):
+        """ Voice dropdown (direct mode): another decoder and its vocoder, loaded in the background. The encoder
+            stays loaded, and voices once loaded stay too, so switching back is instant. """
+        self.args = args
+        current = (args.fastspeech2, args.preprocess_config)
+        self.voices = voice_choices(args.voices)
+        found = [i for i, (_, *files) in enumerate(self.voices) if same_files(files, current)]
+        if not found:  # a decoder from elsewhere, e.g. --fastspeech2 some/run/decoder_best.pt
+            self.voices.append((os.path.dirname(args.fastspeech2) or args.fastspeech2, *current))
+            found = [len(self.voices) - 1]
+        self.voice_index = found[0]
+        self.loaded = {self.voice_index: self.client.w2n}
+        self.voice_box = ttk.Combobox(self.selectors, state="readonly", values=[label for label, _, _ in self.voices])
+        self.voice_box.current(self.voice_index)
+        self.voice_box.bind("<<ComboboxSelected>>", lambda event: self.on_voice())
+        tk.Label(self.selectors, text="Voice").grid(row=2, column=0, sticky="w", padx=(0, 10))
+        self.voice_box.grid(row=2, column=1, sticky="ew", pady=2)
+        self.log_voice()
+
+    def log_voice(self):
+        label, fastspeech2, _ = self.voices[self.voice_index]
+        w2n = self.client.w2n
+        vocoder = f"{w2n.vocoder_spec.name} ({w2n.sample_rate} Hz)"
+        if w2n.vocoder_checkpoint:
+            vocoder += f", fine-tuned: {w2n.vocoder_checkpoint}"
+        self.log(f"voice: {label}")
+        self.log(f"decoder: {fastspeech2}, vocoder: {vocoder}")
+
+    def on_voice(self):
+        index = self.voice_box.current()
+        if index == self.voice_index or self.loading:
+            return
+        if index in self.loaded:
+            self.use_voice(index)
+            return
+        label, fastspeech2, preprocess_config = self.voices[index]
+        self.log(f"loading voice: {label} ...")
+        self.loading = True
+        self.voice_box.configure(state="disabled")
+        result = {}
+
+        def load():
+            try:
+                result["voice"] = load_voice(self.client.w2n, self.args, fastspeech2, preprocess_config)
+            except Exception as e:
+                result["error"] = e
+        thread = threading.Thread(target=load, daemon=True)
+        thread.start()
+        self.after(100, self.finish_loading, thread, result, index)
+
+    def finish_loading(self, thread, result, index):
+        if thread.is_alive():
+            self.after(100, self.finish_loading, thread, result, index)
+            return
+        self.loading = False
+        self.voice_box.configure(state="readonly")
+        if "error" in result:
+            self.log(f"can't load {self.voices[index][0]}: {result['error']}")
+            self.voice_box.current(self.voice_index)
+            return
+        self.loaded[index] = result["voice"]
+        self.use_voice(index)
+
+    def use_voice(self, index):
+        self.client.w2n = self.loaded[index]
+        self.voice_index = index
+        self.log_voice()
+
     def on_press(self, event):
+        if self.loading:
+            self.log("wait: the voice is still loading")
+            return
         self.log("button was pressed")
         self.mic.start_recording()
         self.log("start")
@@ -278,6 +381,8 @@ class MyGUI(tk.Frame):
         self.log(f"keyrelease {event.keycode}")
 
     def on_release(self, event):
+        if not getattr(self.mic, "recording", True):  # the press was ignored
+            return
         self.log("button was released")
         audio = self.mic.stop_recording()
         if audio is not None:
@@ -308,7 +413,7 @@ if __name__ == "__main__":
 
     ### for Direct Whisper-normal object
     parser.add_argument("--preprocess_config",
-        default = 'config/my_preprocess16k_LJ.yaml'
+        default = ENGLISH_CONFIG
     )
 
     parser.add_argument("--model_config",
@@ -332,7 +437,12 @@ if __name__ == "__main__":
         help="fastspeech2 checkpoint path",
         #default="models/fastspeech2/lambda_best.tar"
         #default="models/fastspeech2/googletts_neutral_best.tar"        
-        default="https://github.com/rkmt/wesper-demo/releases/download/v0.1/googletts_neutral_best.tar",
+        default=ENGLISH_DECODER,
+    )
+
+    parser.add_argument("--voices",
+        help="folder of decoder runs offered in the Voice dropdown",
+        default="decoder/runs",
     )
 
     parser.add_argument("--hifigan", 

@@ -12,7 +12,7 @@ import torch.nn.functional as F
 import torch.nn as nn
 from torch.nn import Conv2d
 from torch.nn.utils import weight_norm, spectral_norm
-from torchaudio.transforms import Spectrogram, Resample
+from .resample import Resample  # WESPER: torchaudio's, ported (resample.py), so torchaudio isn't needed
 
 from .env import AttrDict
 from .utils import get_padding
@@ -299,6 +299,8 @@ class DiscriminatorB(nn.Module):
         super().__init__()
         self.window_length = window_length
         self.hop_factor = hop_factor
+        from torchaudio.transforms import Spectrogram  # WESPER: only for MultiBandDiscriminator, which bigvgan22k doesn't use
+
         self.spec_fn = Spectrogram(
             n_fft=window_length,
             hop_length=int(window_length * hop_factor),

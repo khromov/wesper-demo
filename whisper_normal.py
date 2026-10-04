@@ -233,15 +233,16 @@ class MyWhisper2Normal(object):
         # Decoders without that entry, like WESPER's released ones, use WESPER's HiFi-GAN.
         self.vocoder_spec = vocoders.spec(self.preprocess_config.get("vocoder", {}).get("name", vocoders.DEFAULT))
         self.sample_rate = self.vocoder_spec.sample_rate  # of the converted audio
+        self.vocoder_checkpoint = None  # the run's own fine-tuned vocoder, if it brings one
         if load_vocoder:
             if self.vocoder_spec.name == "hifigan16k":
                 print("### loading HiFI GAN")
                 self.vocoder = load_hifigan(self.model_config, checkpoint_path=args.hifigan, device=device).eval()
             else:
                 # A run's own vocoder, fine-tuned on its decoder (decoder/finetune_vocoder.py), if it has one.
-                checkpoint = vocoders.run_checkpoint(self.preprocess_config, os.path.dirname(os.path.abspath(args.preprocess_config)))
-                print("### loading", self.vocoder_spec.name, checkpoint or "")
-                self.vocoder = vocoders.load(self.vocoder_spec, device, checkpoint)
+                self.vocoder_checkpoint = vocoders.run_checkpoint(self.preprocess_config, os.path.dirname(os.path.abspath(args.preprocess_config)))
+                print("### loading", self.vocoder_spec.name, self.vocoder_checkpoint or "")
+                self.vocoder = vocoders.load(self.vocoder_spec, device, self.vocoder_checkpoint)
         print("#### Done.")
 
     def test(self, wavfile='sample_whisper.wav', outfile='/tmp/out.wav'):

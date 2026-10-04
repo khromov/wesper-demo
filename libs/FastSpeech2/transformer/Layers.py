@@ -79,6 +79,9 @@ class PostNet(nn.Module):
 
         super(PostNet, self).__init__()
         self.convolutions = nn.ModuleList()
+        # Dropout on the last layer's output, i.e. on the correction added to the mel, in training.
+        # decoder/train.py --postnet-final-dropout changes it.
+        self.final_dropout = 0.5
 
         self.convolutions.append(
             nn.Sequential(
@@ -131,7 +134,7 @@ class PostNet(nn.Module):
 
         for i in range(len(self.convolutions) - 1):
             x = F.dropout(torch.tanh(self.convolutions[i](x)), 0.5, self.training)
-        x = F.dropout(self.convolutions[-1](x), 0.5, self.training)
+        x = F.dropout(self.convolutions[-1](x), self.final_dropout, self.training)
 
         x = x.contiguous().transpose(1, 2)
         return x

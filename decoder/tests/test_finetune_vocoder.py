@@ -118,6 +118,68 @@ class FlatnessGap(unittest.TestCase):
         self.assertAlmostEqual(ft.flatness_gap(0.5 * x, x, self.SR), 0.0, places=4)
 
 
+class Resample(unittest.TestCase):
+    """libs/bigvgan/resample.py, the port of torchaudio's Resample that the CQT discriminator uses."""
+
+    def test_matches_torchaudio(self):
+        try:
+            import torchaudio
+        except ImportError:
+            self.skipTest("torchaudio isn't installed")
+        from libs.bigvgan.resample import Resample
+        x = torch.randn(3, 1, 5003)
+        for orig, new in ((22050, 44100), (24000, 48000), (16000, 22050)):
+            ours, theirs = Resample(orig, new), torchaudio.transforms.Resample(orig, new)
+            torch.testing.assert_close(ours.kernel, theirs.kernel, rtol=0, atol=0)
+            torch.testing.assert_close(ours(x), theirs(x), rtol=0, atol=0)
+
+    def test_doubles_the_rate_of_a_tone(self):
+        from libs.bigvgan.resample import Resample
+        sr = 22050
+        t = torch.arange(sr) / sr
+        y = Resample(sr, 2 * sr)(torch.sin(2 * np.pi * 440 * t)[None])[0]
+        self.assertEqual(len(y), 2 * sr)
+        expected = torch.sin(2 * np.pi * 440 * torch.arange(2 * sr) / (2 * sr))
+        torch.testing.assert_close(y[1000:-1000], expected[1000:-1000], atol=2e-3, rtol=0)
+
+    def test_the_cqt_discriminator_needs_no_torchaudio(self):
+        code = ("import sys; sys.modules['torchaudio'] = None\n"
+                "from libs.bigvgan.discriminators import MultiScaleSubbandCQTDiscriminator\n"
+                f"from libs.bigvgan.env import AttrDict; import json; MultiScaleSubbandCQTDiscriminator(AttrDict(json.load(open({CONFIG[0]!r}))))")
+        r = subprocess.run([sys.executable, "-c", code], cwd=REPO, capture_output=True, text=True, timeout=300)
+        self.assertEqual(r.returncode, 0, r.stderr[-2000:])
+
+
+class LoadDiscriminator(unittest.TestCase):
+    def test_tolerates_checkpoints_with_or_without_resampling_kernels(self):
+        from libs.bigvgan.env import AttrDict
+        _, mrd = ft.discriminators(AttrDict(TINY))
+        state = mrd.state_dict()
+        kernels = [k for k in state if k.endswith("resample.kernel")]
+        self.assertTrue(kernels)
+        ft.load_discriminator(mrd, state)
+        ft.load_discriminator(mrd, {k: v for k, v in state.items() if k not in kernels})
+        with self.assertRaises(AssertionError):
+            ft.load_discriminator(mrd, {k: v for k, v in state.items() if "conv_post" not in k})
+
+
+class RocmWrapper(unittest.TestCase):
+    def test_runs_the_script_with_miopen_off_and_its_arguments(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            script = os.path.join(tmp, "s.py")
+            with open(script, "w") as f:
+                f.write("import sys, torch\nprint(torch.backends.cudnn.enabled, sys.argv[1:], __name__)\n")
+            r = subprocess.run([sys.executable, os.path.join(REPO, "decoder", "rocm.py"), script, "a", "--b", "c"],
+                               capture_output=True, text=True, timeout=120)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(r.stdout.strip(), "False ['a', '--b', 'c'] __main__")
+
+    def test_explains_itself_without_a_script(self):
+        r = subprocess.run([sys.executable, os.path.join(REPO, "decoder", "rocm.py")], capture_output=True, text=True, timeout=120)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("MIOpen", r.stderr)
+
+
 class Pipeline(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -195,6 +257,29 @@ class Pipeline(unittest.TestCase):
         self.assertIn("decoder mels: 0 computed", result.stdout)
         self.assertIn("resuming from step 4", result.stdout)
         self.assertIn("done at step 6", result.stdout)
+
+    def test_another_decoder_checkpoint(self):
+        # --decoder-checkpoint: e.g. one of train.py --keep-checkpoints' checkpoints/step_NNNNNN.pt
+        checkpoint = os.path.join(self.tmp.name, "step_000002.pt")
+        state = torch.load(os.path.join(self.run_dir, "decoder_best.pt"), map_location="cpu")
+        state["model"] = {k: v * 0.5 if v.is_floating_point() else v for k, v in state["model"].items()}
+        torch.save({**state, "step": 2}, checkpoint)
+        out = os.path.join(self.tmp.name, "run-vft-step2")
+        result = finetune(self.data, self.audio, self.run_dir, out, "--steps", "2", "--decoder-checkpoint", checkpoint)
+        self.assertEqual(result.returncode, 0, result.stderr[-3000:])
+        copied = torch.load(os.path.join(out, "decoder_best.pt"), map_location="cpu")
+        self.assertEqual(copied["step"], 2)
+        r = self.rows[0]["id"]
+        self.assertFalse(np.array_equal(np.load(os.path.join(out, "mels", r + ".npy")),
+                                        np.load(os.path.join(self.out, "mels", r + ".npy"))))
+
+    def test_benchmark_prints_the_speed_and_saves_nothing(self):
+        out = os.path.join(self.tmp.name, "run-vft-benchmark")
+        result = finetune(self.data, self.audio, self.run_dir, out, "--benchmark", "5", "--steps", "1000")
+        self.assertEqual(result.returncode, 0, result.stderr[-3000:])
+        self.assertRegex(result.stdout, r"benchmark: [0-9.]+ s/step .* over 2 steps .* 1000 steps \(--steps 1000\) would take")
+        self.assertFalse(any(os.path.exists(os.path.join(out, n)) for n in ("latest.pt", "bigvgan_generator.pt", "history.json")))
+        self.assertFalse(os.path.exists(os.path.join(out, "samples", "reference")))
 
     def test_refuses_hifigan(self):
         run = os.path.join(self.tmp.name, "hifigan-run")

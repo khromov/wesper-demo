@@ -74,7 +74,8 @@ python decoder/train.py decoder/data/sv-narrator-bigvgan22k decoder/runs/sv-narr
 The decoder's spectrograms are smoother than real ones, and BigVGAN turns the missing detail
 into an electric buzz (it's not in `samples/vocoded-target/`). Fine-tuning BigVGAN on the
 finished decoder's own output teaches it to make her recordings from exactly those spectrograms.
-It needs the BigVGAN run above, and two more packages: `pip install torchaudio nnAudio`.
+It needs the BigVGAN run above, and one more package: `pip install --no-deps nnAudio` (pure
+Python; `--no-deps` leaves your torch alone). torchaudio isn't needed.
 
 ```sh
 # The utterances at 22.05 kHz, cut exactly as prepare_data.py cut them (~2 min, 1.9 GB).
@@ -102,8 +103,68 @@ python decoder/finetune_vocoder.py decoder/data/sv-narrator-bigvgan22k decoder/d
   `DECODER=decoder/runs/sv-narrator-bigvgan22k-vft ./client_direct_sv.sh`. Its
   `preprocess.yaml` names the vocoder (`checkpoint: bigvgan_generator.pt`), and WESPER and the
   web export load it from there.
+- **Another decoder checkpoint:** `--decoder-checkpoint RUN/checkpoints/step_030000.pt` uses that
+  one instead of the run's `decoder_best.pt` (see `--keep-checkpoints` below).
+- **Speed first:** `--benchmark 50` times 50 steps, prints s/step and the time for `--steps`, and
+  exits without saving the vocoder.
 - **Stopping and resuming:** as for the decoder. Out of GPU memory: lower `--batch-size` or
   `--segment-frames`.
+
+## Optional: fine-tune a finished decoder's postnet
+
+The postnet is FastSpeech2's last layer, meant to add detail to the mel. In every trained decoder
+here it adds almost nothing: its last BatchNorm's scale is ~0.01 (the others' ~4). A likely reason
+is the 50% dropout on its output in training, which makes any correction noisy. These options
+give it a fresh start on a finished decoder, training only the postnet:
+
+```sh
+python decoder/train.py decoder/data/sv-narrator-bigvgan22k decoder/runs/sv-narrator-bigvgan22k-postnet --device cuda \
+    --init decoder/runs/sv-narrator-bigvgan22k/decoder_step30000.pt --reset-postnet --postnet-final-dropout 0 \
+    --train-only postnet --lr 1e-4 --steps 3000 --eval-every 500 --save-every 500 --keep-checkpoints
+```
+
+- `--reset-postnet` resets its last BatchNorm (`--reset-postnet all`: the whole postnet).
+  `--postnet-final-dropout 0` removes the dropout on its output; leave it out to compare.
+- `--lr 1e-4` warms up over `--warmup` (200) steps, then decays to a tenth; without it, FastSpeech2's
+  schedule climbs to 1e-3.
+- Every validation prints the buzz measures next to the losses: `flatness` of the samples in
+  0.5–2/2–4/4–8 kHz against `vocoded target`'s, and `sharpness` of the mels against the real ones'.
+  Better is closer to those, with `val` mel and pitch about the same.
+- `--keep-checkpoints` keeps each validation's weights in `checkpoints/step_NNNNNN.pt`, for
+  `finetune_vocoder.py --decoder-checkpoint`.
+- `--benchmark 50` times 50 steps and exits without saving.
+
+## On the training server (Radeon 760M, ROCm)
+
+MIOpen's convolution kernels hang this GPU, so every GPU command goes through `decoder/rocm.py`,
+which turns MIOpen off and runs the script with the same arguments (`decoder/train_rocm.py` does
+the same for `train.py` only). Use `.venv-rocm/bin/python`. The server has no ffmpeg:
+`prepare_data.py` and `export_vocoder_audio.py` run elsewhere, and their output is copied over.
+
+```sh
+cd ~/wesper-demo
+
+# Once: the vocoder fine-tuning's one new package. --no-deps keeps the ROCm build of torch.
+~/.local/bin/uv pip install --python .venv-rocm/bin/python --no-deps nnAudio
+
+# Fine-tune BigVGAN on the decoder (decoder/data/sv-narrator-bigvgan22k-audio comes from export_vocoder_audio.py).
+# First the speed: it computes and caches the decoder's mels (once), then times 50 steps and saves no vocoder.
+.venv-rocm/bin/python decoder/rocm.py decoder/finetune_vocoder.py \
+    decoder/data/sv-narrator-bigvgan22k decoder/data/sv-narrator-bigvgan22k-audio \
+    decoder/runs/sv-narrator-bigvgan22k decoder/runs/sv-narrator-bigvgan22k-vft \
+    --decoder-checkpoint decoder/runs/sv-narrator-bigvgan22k/decoder_step30000.pt --device cuda --benchmark 50
+
+# Then the run: the same command without --benchmark, in the background. Re-run it to resume.
+nohup .venv-rocm/bin/python decoder/rocm.py decoder/finetune_vocoder.py \
+    decoder/data/sv-narrator-bigvgan22k decoder/data/sv-narrator-bigvgan22k-audio \
+    decoder/runs/sv-narrator-bigvgan22k decoder/runs/sv-narrator-bigvgan22k-vft \
+    --decoder-checkpoint decoder/runs/sv-narrator-bigvgan22k/decoder_step30000.pt --device cuda \
+    > decoder/runs/sv-narrator-bigvgan22k-vft.log 2>&1 &
+```
+
+The postnet fine-tuning above runs the same way: `.venv-rocm/bin/python decoder/rocm.py
+decoder/train.py …` with its options (try `--benchmark 50` first). Fine-tune the vocoder on its
+result afterwards: the vocoder learns the decoder it's given.
 
 ## Checking the setup
 

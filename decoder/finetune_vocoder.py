@@ -5,7 +5,7 @@ BigVGAN, trained only on real mels, turns the missing detail into a buzz. Fine-t
 to make the recordings from the decoder's mels. The decoder makes one frame per frame of the
 recording, so its output lines up with the recording frame by frame:
 
-1. The decoder (DECODER_RUN/decoder_best.pt) computes every utterance's mel as in its training:
+1. The decoder (DECODER_RUN/decoder_best.pt, or --decoder-checkpoint) computes every utterance's mel as in its training:
    from the units, with the recording's own pitch and energy, so that the mel also matches the
    recording's intonation. The mels are cached in --cache.
 2. BigVGAN learns to turn random crops of them into the same stretch of the recording (AUDIO_DIR,
@@ -35,6 +35,9 @@ OUT_DIR becomes a decoder run for WESPER: DECODER_RUN's decoder with the fine-tu
                         decoder's mels as WESPER makes them (units only, pitch predicted)
 
 Use it with WESPER like any decoder run: DECODER=OUT_DIR ./client_direct_sv.sh
+
+--benchmark 50 times 50 training steps and prints the speed, without validating or saving the
+vocoder (the decoder's mels are still cached, for the real run to reuse).
 
 usage: python decoder/finetune_vocoder.py DATA_DIR AUDIO_DIR DECODER_RUN OUT_DIR [--steps 20000] [--batch-size 8]
 """
@@ -88,8 +91,8 @@ def save(obj, path):
     os.replace(path + ".tmp", path)
 
 
-def load_decoder(run_dir, device):
-    """A decoder/train.py run's decoder_best.pt in eval mode, and FastSpeech2's model config."""
+def load_decoder(run_dir, device, checkpoint=None):
+    """A decoder/train.py run's decoder_best.pt (or another of its checkpoints) in eval mode, and FastSpeech2's model config."""
     import model.modules
     import utils.tools
     from model import FastSpeech2
@@ -98,8 +101,8 @@ def load_decoder(run_dir, device):
     pre["path"]["preprocessed_path"] = run_dir  # its stats.json, wherever the folder is
     model_config = decoder_train.read_yaml(os.path.join(REPO, "config", "my_model16000.yaml"))
     net = FastSpeech2(pre, model_config)
-    state = torch.load(os.path.join(run_dir, "decoder_best.pt"), map_location="cpu", weights_only=False)
-    net.load_state_dict(state["model"], strict=True)
+    state = torch.load(checkpoint or os.path.join(run_dir, "decoder_best.pt"), map_location="cpu", weights_only=False)
+    net.load_state_dict(state["model"] if "model" in state else state, strict=True)
     return net.to(device).eval(), model_config
 
 
@@ -158,11 +161,20 @@ def discriminators(h):
     return d.MultiPeriodDiscriminator(h), mrd
 
 
-def write_run_files(decoder_run, out_dir):
-    """OUT_DIR as a decoder run: DECODER_RUN's decoder and stats, and a preprocess.yaml naming the fine-tuned vocoder."""
-    for name in ("decoder_best.pt", "stats.json"):
+def load_discriminator(module, state):
+    """load_state_dict, except for the CQT discriminator's resampling kernels: they're computed, not
+    learned, and whether a checkpoint holds them depends on the torchaudio version that saved it."""
+    missing, unexpected = module.load_state_dict(state, strict=False)
+    assert all(k.endswith("resample.kernel") for k in missing + unexpected), (missing, unexpected)
+
+
+def write_run_files(decoder_run, out_dir, checkpoint=None):
+    """OUT_DIR as a decoder run: DECODER_RUN's decoder (decoder_best.pt, or `checkpoint`) and stats, and a
+    preprocess.yaml naming the fine-tuned vocoder."""
+    for name, src in (("decoder_best.pt", checkpoint or os.path.join(decoder_run, "decoder_best.pt")),
+                      ("stats.json", os.path.join(decoder_run, "stats.json"))):
         if not os.path.exists(os.path.join(out_dir, name)):
-            shutil.copy(os.path.join(decoder_run, name), os.path.join(out_dir, name))
+            shutil.copy(src, os.path.join(out_dir, name))
     pre = decoder_train.read_yaml(os.path.join(decoder_run, "preprocess.yaml"))
     pre["path"]["preprocessed_path"] = os.path.relpath(out_dir, REPO)  # as decoder/train.py writes it
     pre["vocoder"] = {**pre.get("vocoder", {"name": vocoders.DEFAULT}), "checkpoint": "bigvgan_generator.pt"}
@@ -176,6 +188,8 @@ def main(argv=None):
     parser.add_argument("data_dir", help="decoder/prepare_data.py's output the decoder was trained on")
     parser.add_argument("audio_dir", help="decoder/export_vocoder_audio.py's output for DATA_DIR")
     parser.add_argument("decoder_run", help="decoder/train.py's run folder (decoder_best.pt, preprocess.yaml, stats.json)")
+    parser.add_argument("--decoder-checkpoint", help="another of the run's checkpoints instead of decoder_best.pt, "
+                        "e.g. RUN/checkpoints/step_030000.pt (train.py --keep-checkpoints)")
     parser.add_argument("out_dir", help="where the fine-tuned run goes; re-run to resume")
     parser.add_argument("--steps", type=int, default=20000)
     parser.add_argument("--batch-size", type=int, default=8)
@@ -189,10 +203,12 @@ def main(argv=None):
     parser.add_argument("--device", default="auto", help="auto (cuda if available, else cpu), cuda, mps or cpu")
     parser.add_argument("--workers", type=int, default=4)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--benchmark", type=int, metavar="N", help="time N training steps, print the speed, and exit without saving")
     args = parser.parse_args(argv)
 
     data_dir, audio_dir, decoder_run, out_dir = (os.path.realpath(p) for p in
                                                  (args.data_dir, args.audio_dir, args.decoder_run, args.out_dir))
+    decoder_checkpoint = os.path.realpath(args.decoder_checkpoint) if args.decoder_checkpoint else None
     cache = os.path.realpath(args.cache) if args.cache else os.path.join(out_dir, "mels")
     device = ("cuda" if torch.cuda.is_available() else "cpu") if args.device == "auto" else args.device
     os.makedirs(os.path.join(out_dir, "samples"), exist_ok=True)
@@ -201,7 +217,7 @@ def main(argv=None):
     torch.manual_seed(args.seed)
     torch.backends.cudnn.benchmark = True  # fixed crop size
 
-    pre = write_run_files(decoder_run, out_dir)
+    pre = write_run_files(decoder_run, out_dir, decoder_checkpoint)
     name = pre["vocoder"]["name"]
     if name == "hifigan16k":
         sys.exit("only BigVGAN can be fine-tuned: WESPER's HiFi-GAN was released without its discriminators")
@@ -221,7 +237,7 @@ def main(argv=None):
     # 1. The decoder's mels, cached.
     with open(os.path.join(decoder_run, "stats.json")) as f:
         stats = json.load(f)
-    net, model_config = load_decoder(decoder_run, device)
+    net, model_config = load_decoder(decoder_run, device, decoder_checkpoint)
     rows = decoder_train.read_segments(data_dir, model_config["max_seq_len"])
     dataset = decoder_train.Utterances(data_dir, rows, stats, voc)
     started = time.time()
@@ -243,8 +259,9 @@ def main(argv=None):
     latest = os.path.join(out_dir, "latest.pt")
     if os.path.exists(latest):
         state = torch.load(latest, map_location="cpu", weights_only=False)
-        for module, key in ((generator, "generator"), (mpd, "mpd"), (mrd, "mrd"), (optim_g, "optim_g"), (optim_d, "optim_d")):
+        for module, key in ((generator, "generator"), (mpd, "mpd"), (optim_g, "optim_g"), (optim_d, "optim_d")):
             module.load_state_dict(state[key])
+        load_discriminator(mrd, state["mrd"])
         step, best, history = state["step"], state["best"], state["history"]
         print(f"resuming from step {step}", flush=True)
     else:
@@ -254,8 +271,9 @@ def main(argv=None):
                                                  map_location="cpu", weights_only=False)["generator"])
             state = torch.load(vocoders.bigvgan_file(name, "bigvgan_discriminator_optimizer.pt"),
                                map_location="cpu", weights_only=False)
-            for module, key in ((mpd, "mpd"), (mrd, "mrd"), (optim_g, "optim_g"), (optim_d, "optim_d")):
+            for module, key in ((mpd, "mpd"), (optim_g, "optim_g"), (optim_d, "optim_d")):
                 module.load_state_dict(state[key])
+            load_discriminator(mrd, state["mrd"])
             del state
             print(f"starting from NVIDIA's {name}: generator, discriminators and optimizer states", flush=True)
     for optim in (optim_g, optim_d):
@@ -289,30 +307,31 @@ def main(argv=None):
         return {"flatness_gap": float(np.mean(gaps)), "mel": float(np.mean(errors))}
 
     reference = os.path.join(out_dir, "samples", "reference")
-    if not os.path.exists(reference):
+    if not os.path.exists(reference) and not args.benchmark:
         os.makedirs(reference)
         for r in sample_rows:
             wav, _ = export_vocoder_audio.load(os.path.join(audio_dir, r["id"] + ".flac"))
             sf.write(os.path.join(reference, r["id"] + ".wav"), wav, voc.sample_rate, subtype="FLOAT")
-    if step == 0:
+    if step == 0 and not args.benchmark:
         scores = evaluate()
         best = scores["flatness_gap"]
         history["val"].append({"step": 0, **scores})
         save({"generator": generator.state_dict()}, os.path.join(out_dir, "bigvgan_generator.pt"))
         print(f"  val flatness gap {scores['flatness_gap']:.4f}, mel {scores['mel']:.4f} with the original vocoder", flush=True)
-    baseline = history["val"][0]
+    baseline = history["val"][0] if history["val"] else None
 
     # 3. Training, as NVIDIA's train.py does it.
     rng = torch.Generator().manual_seed(args.seed + step)
     generator.train(), mpd.train(), mrd.train()
     running, started, start_step = [], time.time(), step
-    while step < args.steps:
+    timed = (step, started)  # --benchmark: timed from here, or after 3 warm-up steps
+    while step < args.steps or args.benchmark:
         loader = torch.utils.data.DataLoader(
             Crops(train_ids, cache, audio_dir, args.segment_frames, voc.hop), batch_size=args.batch_size, shuffle=True,
             drop_last=True, generator=rng, num_workers=args.workers, pin_memory=device == "cuda",
             timeout=300 if args.workers else 0)
         for x, y in loader:
-            if step >= args.steps:
+            if step >= args.steps and not args.benchmark:
                 break
             x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
             y_g_hat = generator(x)
@@ -339,6 +358,20 @@ def main(argv=None):
             optim_g.step()
             step += 1
             running.append([loss_mel.item(), loss_fm.item(), loss_adv.item(), loss_disc.item()])
+
+            if args.benchmark:
+                if device == "cuda":
+                    torch.cuda.synchronize()
+                if step - start_step == 3 and args.benchmark > 3:
+                    timed = (step, time.time())
+                if step - start_step >= args.benchmark:
+                    per_step = (time.time() - timed[1]) / (step - timed[0])
+                    left = max(args.steps - start_step, 0)
+                    print(f"benchmark: {per_step:.2f} s/step ({1 / per_step:.2f} steps/s) over {step - timed[0]} steps at batch "
+                          f"{args.batch_size}, {args.segment_frames} frames; {left} steps (--steps {args.steps}) would take "
+                          f"{left * per_step / 3600:.1f} h, plus validations. The vocoder wasn't saved.", flush=True)
+                    return
+                continue
 
             if step % 100 == 0 or step == args.steps:
                 m = np.mean(running, axis=0)

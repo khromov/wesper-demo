@@ -7,8 +7,10 @@ torch's hub cache:
     WESPER_DECODER_SMOKE=1 .venv/bin/python -m unittest discover -s decoder/tests -v
 """
 import argparse
+import json
 import os
 import random
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -119,6 +121,131 @@ class DurationPredictorFix(unittest.TestCase):
         self.assertTrue(all(torch.isfinite(l) for l in losses))
 
 
+def tiny_decoder():
+    """FastSpeech2 as train.py builds it, with random weights, on the CPU."""
+    cwd = os.getcwd()
+    os.chdir(REPO)
+    try:
+        pre, model_config, _ = train.configs(os.path.join(REPO, "preprocessed_data", "googletts"))
+        import utils.tools
+        import model.modules
+        from model import FastSpeech2
+        utils.tools.device = model.modules.device = "cpu"
+        torch.manual_seed(0)
+        return FastSpeech2(pre, model_config)
+    finally:
+        os.chdir(cwd)
+
+
+class FineTuning(unittest.TestCase):
+    """The options for fine-tuning a finished decoder (--init, --reset-postnet, --lr, --train-only)."""
+
+    def test_loads_any_decoder_checkpoint(self):
+        net = tiny_decoder()
+        sd = net.state_dict()
+        with tempfile.TemporaryDirectory() as tmp:
+            for name, obj in (("best.pt", {"model": sd, "step": 3, "val": {}}), ("bare.pt", sd),
+                              ("latest.pt", {"model": sd, "optimizer": {}, "step": 3})):
+                torch.save(obj, os.path.join(tmp, name))
+                loaded = train.load_init(os.path.join(tmp, name))
+                self.assertEqual(set(loaded), set(sd), name)
+
+    def final_norm(self, net):
+        return net.postnet.convolutions[-1][1]
+
+    def test_reset_final_norm_unmutes_only_the_last_batchnorm(self):
+        net = tiny_decoder()
+        with torch.no_grad():
+            for m in net.postnet.convolutions:
+                m[1].weight.fill_(0.01)
+        conv_before = net.postnet.convolutions[-1][0].conv.weight.clone()
+        train.reset_postnet(net, "final-norm")
+        final = self.final_norm(net)
+        self.assertTrue(torch.equal(final.weight, torch.ones_like(final.weight)))
+        self.assertTrue(torch.equal(final.bias, torch.zeros_like(final.bias)))
+        self.assertTrue(torch.equal(final.running_var, torch.ones_like(final.running_var)))
+        self.assertTrue(torch.equal(net.postnet.convolutions[-1][0].conv.weight, conv_before))
+        self.assertTrue(torch.allclose(net.postnet.convolutions[0][1].weight, torch.tensor(0.01)))
+
+    def test_reset_all_reinitializes_the_postnet_only(self):
+        net = tiny_decoder()
+        before = {k: v.clone() for k, v in net.state_dict().items()}
+        with torch.no_grad():
+            for p in net.postnet.parameters():
+                p.fill_(0.5)
+        train.reset_postnet(net, "all")
+        after = net.state_dict()
+        for k in before:
+            if k.startswith("postnet.") and k.endswith("conv.weight"):
+                self.assertFalse(torch.allclose(after[k], torch.tensor(0.5)), k)
+            elif not k.startswith("postnet."):
+                self.assertTrue(torch.equal(after[k], before[k]), k)
+        self.assertTrue(torch.equal(self.final_norm(net).weight, torch.ones(80)))
+
+    def test_postnet_final_dropout_applies_to_the_correction_in_training_only(self):
+        net = tiny_decoder()
+        self.assertEqual(net.postnet.final_dropout, 0.5)  # FastSpeech2's, unless --postnet-final-dropout
+        x = torch.randn(2, 20, 80)
+        net.postnet.final_dropout = 1.0
+        net.train()
+        self.assertTrue(torch.equal(net.postnet(x), torch.zeros_like(x)))
+        net.eval()
+        a = net.postnet(x)
+        net.postnet.final_dropout = 0.5
+        torch.testing.assert_close(net.postnet(x), a)
+        self.assertGreater(a.abs().mean().item(), 0)
+
+    def test_finetune_lr_warms_up_then_decays_to_a_tenth(self):
+        lrs = [train.finetune_lr(s, 1e-4, 100, 1000) for s in range(1000)]
+        self.assertAlmostEqual(lrs[0], 1e-6)
+        self.assertAlmostEqual(lrs[99], 1e-4)
+        self.assertAlmostEqual(max(lrs), 1e-4)
+        self.assertTrue(all(a >= b for a, b in zip(lrs[100:], lrs[101:])))
+        self.assertAlmostEqual(train.finetune_lr(1000, 1e-4, 100, 1000), 1e-5)
+
+    def test_train_only_postnet_keeps_the_rest_in_eval_mode(self):
+        net = tiny_decoder()
+        train.train_mode(net, "postnet")
+        self.assertTrue(net.postnet.training)
+        self.assertFalse(net.encoder.training or net.decoder.training or net.variance_adaptor.training)
+        train.train_mode(net)
+        self.assertTrue(net.encoder.training and net.postnet.training)
+
+
+class BuzzMeasures(unittest.TestCase):
+    SR = 22050
+
+    def voice(self, seconds=1.0):
+        t = np.arange(int(seconds * self.SR)) / self.SR
+        return (0.1 * sum(np.sin(2 * np.pi * 150 * k * t) / k for k in range(1, 50))).astype(np.float32)
+
+    def test_flatness_is_low_for_harmonics_and_high_for_noise(self):
+        voice = train.band_flatness(self.voice(), self.SR)
+        noise = train.band_flatness(np.random.default_rng(0).standard_normal(self.SR).astype(np.float32), self.SR)
+        self.assertEqual(len(voice), 3)
+        self.assertTrue(all(v < 0.1 for v in voice), voice)
+        self.assertTrue(all(n > 0.4 for n in noise), noise)
+
+    def test_flatness_rises_with_buzz(self):
+        x = self.voice()
+        noise = np.random.default_rng(0).standard_normal(len(x)).astype(np.float32) * 0.003
+        clean, buzzy = train.band_flatness(x, self.SR), train.band_flatness(x + noise, self.SR)
+        self.assertTrue(all(b > c for b, c in zip(buzzy, clean)), (clean, buzzy))
+
+    def test_flatness_uses_the_loudest_half_of_the_frames(self):
+        x = self.voice()
+        quiet = np.random.default_rng(0).standard_normal(len(x) // 2).astype(np.float32) * 1e-4
+        np.testing.assert_allclose(train.band_flatness(np.concatenate([x, quiet]), self.SR),
+                                   train.band_flatness(x, self.SR), atol=0.02)
+
+    def test_sharpness_is_lower_for_a_blurred_mel(self):
+        rng = np.random.default_rng(0)
+        mel = rng.standard_normal((50, 80))
+        blurred = (mel[:, :-2] + mel[:, 1:-1] + mel[:, 2:]) / 3
+        self.assertGreater(train.mel_sharpness(mel), 2 * train.mel_sharpness(blurred))
+        self.assertEqual(train.mel_sharpness(np.ones((5, 80))), 0.0)
+
+
 @unittest.skipUnless(os.environ.get("WESPER_DECODER_SMOKE"), "set WESPER_DECODER_SMOKE=1 to train on fake data")
 class Smoke(unittest.TestCase):
     @classmethod
@@ -151,6 +278,44 @@ class Smoke(unittest.TestCase):
             self.assertTrue(os.path.exists(os.path.join(self.run_dir, name)), name)
         for folder in ("reference", "vocoded-target", "step_000002", "step_000004"):
             self.assertEqual(len(os.listdir(os.path.join(self.run_dir, "samples", folder))), 1, folder)
+
+    def test_fine_tunes_the_postnet_of_a_finished_run(self):
+        init = os.path.join(self.tmp.name, "finished.pt")  # a copy: test_resumes changes the run
+        shutil.copy(os.path.join(self.run_dir, "decoder_best.pt"), init)
+        run = os.path.join(self.tmp.name, "postnet")
+        result = subprocess.run(
+            [sys.executable, os.path.join(REPO, "decoder", "train.py"), self.data, run, "--init", init,
+             "--reset-postnet", "--train-only", "postnet", "--postnet-final-dropout", "0", "--lr", "1e-4", "--warmup", "1",
+             "--keep-checkpoints", "--steps", "2", "--batch-size", "2", "--eval-every", "1", "--save-every", "2",
+             "--samples", "1", "--workers", "0", "--device", "cpu"], capture_output=True, text=True, timeout=900)
+        self.assertEqual(result.returncode, 0, result.stderr[-3000:])
+        self.assertIn("reset the postnet (final-norm)", result.stdout)
+        self.assertIn("training only the postnet", result.stdout)
+        self.assertRegex(result.stdout, r"buzz \(pitch predicted\): flatness 0.5-2/2-4/4-8 kHz [0-9.]+/[0-9.]+/[0-9.]+ \(vocoded target [0-9.]+/")
+        before = torch.load(init, map_location="cpu")["model"]
+        for step in (1, 2):
+            after = torch.load(os.path.join(run, "checkpoints", f"step_{step:06d}.pt"), map_location="cpu")
+            self.assertEqual(after["step"], step)
+            for k, v in after["model"].items():
+                if not k.startswith("postnet."):
+                    self.assertTrue(torch.equal(v, before[k]), k)
+        self.assertFalse(torch.equal(after["model"]["postnet.convolutions.0.0.conv.weight"],
+                                     before["postnet.convolutions.0.0.conv.weight"]))
+        with open(os.path.join(run, "history.json")) as f:
+            val = json.load(f)["val"]
+        self.assertEqual([v["step"] for v in val], [1, 2])
+        for key in ("flatness", "sharpness", "sharpness_real", "mel_inference"):
+            self.assertIn(key, val[-1])
+
+    def test_benchmark_prints_the_speed_and_saves_nothing(self):
+        run = os.path.join(self.tmp.name, "benchmark")
+        result = subprocess.run(
+            [sys.executable, os.path.join(REPO, "decoder", "train.py"), self.data, run, "--benchmark", "5",
+             "--steps", "3000", "--batch-size", "2", "--workers", "0", "--device", "cpu"],
+            capture_output=True, text=True, timeout=900)
+        self.assertEqual(result.returncode, 0, result.stderr[-3000:])
+        self.assertRegex(result.stdout, r"benchmark: [0-9.]+ s/step .* over 2 steps at batch 2; 3000 steps .* would take")
+        self.assertFalse(any(os.path.exists(os.path.join(run, n)) for n in ("latest.pt", "decoder_best.pt", "history.json")))
 
     def test_resumes(self):
         result = self.train_steps(6)

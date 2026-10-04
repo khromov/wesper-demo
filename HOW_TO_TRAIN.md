@@ -124,7 +124,9 @@ original encoder records no level, so it behaves exactly as before.
 
 - **GUI:** `./client_direct_sv.sh`. Pick your microphone and output device in the dropdowns,
   then hold the button, whisper, and release. The log shows which encoder is loaded and that
-  input is normalized.
+  input is normalized. The **Voice** dropdown switches between WESPER's English voice and
+  every trained decoder in `decoder/runs/` (see HOW_TO_TRAIN_DECODER.md), labeled with its
+  vocoder.
 - **A file:** `.venv/bin/python convert.py --hubert colab/data/runs/n2w-finetune/encoder_best.pt --input my_whisper.wav --output converted.wav`
 - **Server mode:** start `server.py` with the same `--hubert` path.
 
@@ -161,6 +163,6 @@ your computer, not on Colab:
 # whole notebook on CPU, ~40 s once WESPER's checkpoints are cached)
 .venv/bin/python -m unittest discover -s colab/tests -v
 
-# Tests for the input normalization and the GUI's device selectors (~7 s)
+# Tests for the input normalization and the GUI's device and voice selectors (~7 s)
 .venv/bin/python -m unittest discover -s tests -v
 ```

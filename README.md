@@ -48,7 +48,8 @@ mac$ client_direct_sv.sh # encoder fine-tuned for Swedish whispers (see HOW_TO_T
 ```
 
 Choose the microphone and output device in the GUI's dropdowns, or pass `--sd N` to start
-with input device `N` (the device list is printed at startup).
+with input device `N` (the device list is printed at startup). The Voice dropdown switches
+between WESPER's English voice and the decoders trained in `decoder/runs/`.
 
 ### In the browser
 The same push-to-talk demo, running entirely in the browser (WebGPU, or WebAssembly as a fallback),

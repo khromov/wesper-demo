@@ -3,7 +3,8 @@
 # Its input is normalized to the speech level it was trained on automatically.
 # Once a Swedish decoder has been trained (see HOW_TO_TRAIN_DECODER.md) it speaks with that
 # voice; until then, WESPER's English one. DECODER picks the run folder, and with it the
-# vocoder, e.g. DECODER=decoder/runs/sv-narrator-bigvgan22k ./client_direct_sv.sh
+# vocoder, e.g. DECODER=decoder/runs/sv-narrator-bigvgan22k ./client_direct_sv.sh. The GUI's
+# Voice dropdown switches to any other run in decoder/runs/ while it's running.
 # Extra arguments are passed on, e.g. --sd 4 to record from input device 4.
 cd "$(dirname "$0")"  # paths below are relative to the repo
 PYTHON=.venv/bin/python  # the repo's venv, so it works without activating it
