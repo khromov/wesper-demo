@@ -380,18 +380,20 @@ def main(argv=None):
             raise SystemExit("no encoder checkpoints found")
 
         configs = load_configs()
-        loaded = {}  # vocoder name -> model, loaded once
+        loaded = {}  # (vocoder name, checkpoint) -> model, loaded once
 
-        def vocoder_for(voc):
-            if voc.name not in loaded:
+        def vocoder_for(voc, checkpoint=None):
+            """The vocoder, from a run's own fine-tuned checkpoint (decoder/finetune_vocoder.py) if it has one."""
+            if (voc.name, checkpoint) not in loaded:
                 if voc.name == "hifigan16k":
-                    loaded[voc.name] = wn.load_hifigan(configs[1], checkpoint_path=args.hifigan, device="cpu")
+                    model = wn.load_hifigan(configs[1], checkpoint_path=args.hifigan, device="cpu")
                 else:
-                    loaded[voc.name] = vocoders.load(voc)
-                    log(f"  {voc.name}: {fixed_bigvgan_filters(loaded[voc.name], voc.n_mels)} anti-aliasing filters given fixed kernels")
-            return loaded[voc.name]
+                    model = vocoders.load(voc, checkpoint=checkpoint)
+                    log(f"  {voc.name}: {fixed_bigvgan_filters(model, voc.n_mels)} anti-aliasing filters given fixed kernels")
+                loaded[voc.name, checkpoint] = model
+            return loaded[voc.name, checkpoint]
 
-        decoders = []  # (id, configs, checkpoint, vocoder spec)
+        decoders = []  # (id, configs, checkpoint, vocoder spec, vocoder checkpoint or None)
         for did, folder in (("sv-narrator", args.sv_decoder), ("sv-narrator-bigvgan", args.sv_bigvgan_decoder)):
             run = folder and os.path.abspath(folder)
             if not (run and os.path.exists(os.path.join(run, "decoder_best.pt"))):
@@ -401,15 +403,16 @@ def main(argv=None):
             voc = run_vocoder(cfg[0])
             if voc.name != DECODERS[did][2]:
                 raise SystemExit(f"{run} was trained for {voc.name}, but the {DECODERS[did][0]} voice is for {DECODERS[did][2]}")
-            decoders.append((did, cfg, os.path.join(run, "decoder_best.pt"), voc))
-        decoders.append(("googletts", configs, args.fastspeech2, vocoders.HIFIGAN16K))
+            decoders.append((did, cfg, os.path.join(run, "decoder_best.pt"), voc, vocoders.run_checkpoint(cfg[0], run)))
+        decoders.append(("googletts", configs, args.fastspeech2, vocoders.HIFIGAN16K, None))
         decoders.sort(key=lambda d: list(DECODERS).index(d[0]))
-        for did, cfg, checkpoint, voc in decoders:
+        for did, cfg, checkpoint, voc, voc_checkpoint in decoders:
             source = [checkpoint if checkpoint.startswith("http") else os.path.relpath(checkpoint, REPO),
-                      args.hifigan if voc.name == "hifigan16k" else voc.checkpoint]
+                      os.path.relpath(voc_checkpoint, REPO) if voc_checkpoint
+                      else args.hifigan if voc.name == "hifigan16k" else voc.checkpoint]
             log(f"### decoder {did}: {source[0]} + {voc.name}")
             fs2 = wn.load_fastspeech2(cfg, checkpoint_path=checkpoint, device="cpu")
-            info, checks = export_decoder(fs2, vocoder_for(voc), did, out, units_for_decoder, log, voc)
+            info, checks = export_decoder(fs2, vocoder_for(voc, voc_checkpoint), did, out, units_for_decoder, log, voc)
             manifest["decoders"].append({"id": did, "label": DECODERS[did][0], "description": DECODERS[did][1],
                                          "vocoder": voc.name, "sampleRate": voc.sample_rate, "hop": voc.hop,
                                          "source": source, "file": info, "checks": checks})

@@ -238,8 +238,10 @@ class MyWhisper2Normal(object):
                 print("### loading HiFI GAN")
                 self.vocoder = load_hifigan(self.model_config, checkpoint_path=args.hifigan, device=device).eval()
             else:
-                print("### loading", self.vocoder_spec.name)
-                self.vocoder = vocoders.load(self.vocoder_spec, device)
+                # A run's own vocoder, fine-tuned on its decoder (decoder/finetune_vocoder.py), if it has one.
+                checkpoint = vocoders.run_checkpoint(self.preprocess_config, os.path.dirname(os.path.abspath(args.preprocess_config)))
+                print("### loading", self.vocoder_spec.name, checkpoint or "")
+                self.vocoder = vocoders.load(self.vocoder_spec, device, checkpoint)
         print("#### Done.")
 
     def test(self, wavfile='sample_whisper.wav', outfile='/tmp/out.wav'):

@@ -97,6 +97,22 @@ class UnitsToFrames(unittest.TestCase):
         self.assertTrue(torch.allclose(out, torch.full((34, 8), 3.0)))
 
 
+class RunCheckpoint(unittest.TestCase):
+    def test_a_fine_tuned_run_names_its_vocoder_relative_to_its_folder(self):
+        pre = {"vocoder": {"name": "bigvgan22k", "checkpoint": "bigvgan_generator.pt"}}
+        self.assertEqual(vocoders.run_checkpoint(pre, "/runs/x"), os.path.join("/runs/x", "bigvgan_generator.pt"))
+
+    def test_other_runs_use_the_released_vocoder(self):
+        for pre in ({}, {"vocoder": {"name": "bigvgan22k"}}, {"vocoder": {"name": "hifigan16k"}}):
+            self.assertIsNone(vocoders.run_checkpoint(pre, "/runs/x"))
+
+    def test_bigvgan_spec_reads_the_config(self):
+        c = {"sampling_rate": 22050, "n_fft": 1024, "hop_size": 256, "win_size": 1024, "num_mels": 80, "fmin": 0, "fmax": 8000}
+        s = vocoders.bigvgan_spec("bigvgan22k", c)
+        self.assertEqual((s.sample_rate, s.hop, s.n_mels, s.fmax), (22050, 256, 80, 8000))
+        self.assertTrue(s.checkpoint.endswith("/bigvgan_v2_22khz_80band_fmax8k_256x/resolve/main/bigvgan_generator.pt"))
+
+
 BIGVGAN_CACHE = os.path.join(torch.hub.get_dir(), "checkpoints", "bigvgan", "bigvgan_v2_22khz_80band_fmax8k_256x",
                              "bigvgan_generator.pt")
 

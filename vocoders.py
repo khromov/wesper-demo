@@ -4,6 +4,8 @@ A decoder is trained for one vocoder: decoder/prepare_data.py --vocoder computes
 with that vocoder's settings, and decoder/train.py records the vocoder's name in the run's
 preprocess.yaml (vocoder: {name: ...}). whisper_normal.py reads it and loads the matching
 vocoder. Decoders without that entry, like WESPER's released ones, use WESPER's own HiFi-GAN.
+A run whose BigVGAN was fine-tuned on its decoder (decoder/finetune_vocoder.py) also names the
+checkpoint, relative to the run's folder: vocoder: {name: ..., checkpoint: bigvgan_generator.pt}.
 
   hifigan16k   WESPER's 16 kHz HiFi-GAN (hifigan/, checkpoint g_00205000). 80 mels up to 8 kHz,
                hop 320 = 20 ms: exactly one mel frame per speech unit.
@@ -85,10 +87,37 @@ def spec(name=DEFAULT):
         return HIFIGAN16K
     if not ALIASES.get(name, name).startswith("bigvgan:"):
         raise ValueError(f"unknown vocoder {name!r}: use hifigan16k, bigvgan22k or bigvgan:<model>")
-    c = _bigvgan_config(name)
-    model = _bigvgan_model(name)
+    return bigvgan_spec(name, _bigvgan_config(name))
+
+
+def bigvgan_spec(name, config):
+    """The settings of a BigVGAN model from its config.json."""
+    c, model = config, _bigvgan_model(name)
     return Spec(name, c["sampling_rate"], c["n_fft"], c["hop_size"], c["win_size"], c["num_mels"], c["fmin"],
                 c["fmax"], f"{NVIDIA}/{model}/resolve/main/bigvgan_generator.pt")
+
+
+def bigvgan_config(name):
+    """A BigVGAN model's config.json: its architecture, mel settings and training settings."""
+    return _bigvgan_config(name)
+
+
+def bigvgan_file(name, filename):
+    """Local path of one of a BigVGAN model's files from NVIDIA, downloaded the first time: e.g.
+    bigvgan_generator.pt, or bigvgan_discriminator_optimizer.pt (its discriminators and optimizer
+    states, 1.4 GB for bigvgan22k), which decoder/finetune_vocoder.py fine-tunes from."""
+    model = _bigvgan_model(name)
+    return fetch(f"{NVIDIA}/{model}/resolve/main/{filename}", os.path.join("bigvgan", model))
+
+
+def run_checkpoint(preprocess_config, run_dir):
+    """The vocoder checkpoint a decoder run brings, or None for the vocoder's released one.
+
+    decoder/finetune_vocoder.py names it in the run's preprocess.yaml as vocoder: {checkpoint: ...},
+    relative to the run's folder, so the folder can move between computers.
+    """
+    path = preprocess_config.get("vocoder", {}).get("checkpoint")
+    return os.path.join(run_dir, path) if path else None
 
 
 _MEL_BASIS = {}

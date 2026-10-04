@@ -69,6 +69,39 @@ python decoder/train.py decoder/data/sv-narrator-bigvgan22k decoder/runs/sv-narr
 - **Web app:** `web/export_models.py` adds this run as a third voice, *Swedish narrator
   (BigVGAN)*, when the folder exists (see web/README.md).
 
+## Optional: fine-tune BigVGAN on the decoder
+
+The decoder's spectrograms are smoother than real ones, and BigVGAN turns the missing detail
+into an electric buzz (it's not in `samples/vocoded-target/`). Fine-tuning BigVGAN on the
+finished decoder's own output teaches it to make her recordings from exactly those spectrograms.
+It needs the BigVGAN run above, and two more packages: `pip install torchaudio nnAudio`.
+
+```sh
+# The utterances at 22.05 kHz, cut exactly as prepare_data.py cut them (~2 min, 1.9 GB).
+python decoder/export_vocoder_audio.py swe-audiobook/book1 decoder/data/sv-narrator-bigvgan22k decoder/data/sv-narrator-bigvgan22k-audio
+
+python decoder/finetune_vocoder.py decoder/data/sv-narrator-bigvgan22k decoder/data/sv-narrator-bigvgan22k-audio \
+    decoder/runs/sv-narrator-bigvgan22k decoder/runs/sv-narrator-bigvgan22k-vft --device cuda
+```
+
+- **Pairs:** the decoder computes each utterance's spectrogram with the recording's own pitch
+  and energy, as in its training. Its output lines up with the recording frame by frame, so
+  BigVGAN can learn to turn it into exactly that recording.
+- **Starting point:** NVIDIA's generator, discriminators and optimizer states (a 1.4 GB
+  download), with NVIDIA's losses.
+- **Validation:** `val mel` is how far the vocoder's output, from the decoder's spectrograms, is
+  from her recordings. Step 0 is the original vocoder; lower is better. `bigvgan_generator.pt`
+  keeps the best.
+- **Samples:** `samples/step_NNNNNN/` holds the decoder's output as WESPER makes it (pitch
+  predicted) through the vocoder so far. `step_000000/` is the original vocoder, and
+  `reference/` the narrator.
+- **Use it:** the output folder is a complete decoder run with its own vocoder:
+  `DECODER=decoder/runs/sv-narrator-bigvgan22k-vft ./client_direct_sv.sh`. Its
+  `preprocess.yaml` names the vocoder (`checkpoint: bigvgan_generator.pt`), and WESPER and the
+  web export load it from there.
+- **Stopping and resuming:** as for the decoder. Out of GPU memory: lower `--batch-size` or
+  `--segment-frames`.
+
 ## Checking the setup
 
 ```sh
