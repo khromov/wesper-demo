@@ -89,9 +89,12 @@ python decoder/finetune_vocoder.py decoder/data/sv-narrator-bigvgan22k decoder/d
   BigVGAN can learn to turn it into exactly that recording.
 - **Starting point:** NVIDIA's generator, discriminators and optimizer states (a 1.4 GB
   download), with NVIDIA's losses.
-- **Validation:** `val mel` is how far the vocoder's output, from the decoder's spectrograms, is
-  from her recordings. Step 0 is the original vocoder; lower is better. `bigvgan_generator.pt`
-  keeps the best.
+- **Validation:** the vocoder turns the decoder's spectrograms of the validation utterances into
+  audio, and it's compared with her recordings. Step 0 is the original vocoder; lower is better.
+  - `flatness gap`: how much more noise-like than her voice the output is, in 0.5–2, 2–4 and
+    4–8 kHz. That's the buzz. `bigvgan_generator.pt` keeps the checkpoint with the smallest gap.
+  - `mel`: the average spectrogram difference. It's only logged: it rewards smooth output, so it
+    gets slightly worse while the buzz goes away.
 - **Samples:** `samples/step_NNNNNN/` holds the decoder's output as WESPER makes it (pitch
   predicted) through the vocoder so far. `step_000000/` is the original vocoder, and
   `reference/` the narrator.

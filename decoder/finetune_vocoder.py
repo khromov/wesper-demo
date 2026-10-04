@@ -13,12 +13,19 @@ recording, so its output lines up with the recording frame by frame:
    NVIDIA's released generator, discriminators and optimizer states (bigvgan_discriminator_optimizer.pt,
    1.4 GB), so the adversarial training picks up where theirs ended.
 
-Validation measures how close the vocoder gets to the recordings from the decoder's mels: the mean
-absolute difference between the mel of its output and the recording's mel ("val mel"), over the
-validation utterances. Step 0 is the original vocoder.
+Validation runs the vocoder on the decoder's mels of the validation utterances and compares its
+output with the recordings, two ways (step 0 is the original vocoder):
+
+  flatness gap  how far the output's spectral flatness is from the recording's, in 0.5-2, 2-4
+                and 4-8 kHz: the buzz makes speech more noise-like, so flatter. bigvgan_generator.pt
+                keeps the checkpoint with the smallest gap.
+  val mel       the mean absolute difference of their mels. It isn't used to choose: like the
+                decoder's L1 loss it rewards smooth, averaged output, so it gets worse as the
+                vocoder adds the missing detail: in a first run it went from 0.47 to 0.49 in 1,000
+                steps, while the samples' flatness gap halved.
 
 OUT_DIR becomes a decoder run for WESPER: DECODER_RUN's decoder with the fine-tuned vocoder.
-  bigvgan_generator.pt  the vocoder with the best val mel so far (at first the original), in NVIDIA's format
+  bigvgan_generator.pt  the vocoder with the smallest flatness gap so far (at first the original), in NVIDIA's format
   decoder_best.pt, stats.json  copied from DECODER_RUN
   preprocess.yaml       DECODER_RUN's, pointing at this folder and at bigvgan_generator.pt
   latest.pt             everything needed to resume; re-running the same command continues
@@ -51,6 +58,29 @@ from decoder import export_vocoder_audio, train as decoder_train  # noqa: E402  
 import vocoders  # noqa: E402
 
 SAMPLES = 6
+BANDS = ((500, 2000), (2000, 4000), (4000, 8000))  # Hz, for the flatness gap
+
+
+def flatness_gap(out, recording, sample_rate, n_fft=1024, hop=256):
+    """How far the spectral flatness of `out` is from the recording's: the absolute difference in each of
+    BANDS, averaged. Flatness is the geometric over the arithmetic mean of a frame's power spectrum: near 1
+    for noise, low for a voice's harmonics. Only the recording's speech frames count (within 35 dB of its
+    loudest frame)."""
+    def power(x):
+        x = torch.as_tensor(np.asarray(x, dtype=np.float32))
+        return torch.stft(x, n_fft, hop, window=torch.hann_window(n_fft), return_complex=True).abs().pow(2).double().numpy() + 1e-12
+    p_out, p_rec = power(out), power(recording)
+    n = min(p_out.shape[1], p_rec.shape[1])
+    p_out, p_rec = p_out[:, :n], p_rec[:, :n]
+    level = 10 * np.log10(p_rec.sum(0))
+    speech = level > level.max() - 35
+    freqs = np.fft.rfftfreq(n_fft, 1 / sample_rate)
+    gaps = []
+    for lo, hi in BANDS:
+        band = (freqs >= lo) & (freqs < hi)
+        flat = [np.mean(np.exp(np.log(p[band][:, speech]).mean(0)) / p[band][:, speech].mean(0)) for p in (p_out, p_rec)]
+        gaps.append(abs(flat[0] - flat[1]))
+    return float(np.mean(gaps))
 
 
 def save(obj, path):
@@ -234,14 +264,18 @@ def main(argv=None):
     mel_loss = MultiScaleMelSpectrogramLoss(sampling_rate=h["sampling_rate"])
     clip = h.get("clip_grad_norm", 1000.0)
 
+    recordings = {r["id"]: export_vocoder_audio.load(os.path.join(audio_dir, r["id"] + ".flac"))[0] for r in val_rows}
+
     @torch.no_grad()
     def evaluate():
-        """Val mel, and the samples at this step."""
+        """The flatness gap and val mel, and the samples at this step."""
         generator.eval()
-        errors = []
+        gaps, errors = [], []
         for r in val_rows:
             mel = torch.from_numpy(np.load(os.path.join(cache, r["id"] + ".npy")).astype(np.float32))[None].to(device)
-            out, _ = vocoders.mel_energy(generator(mel).squeeze().float().cpu().numpy(), voc)
+            wav = generator(mel).squeeze().float().cpu().numpy()
+            gaps.append(flatness_gap(wav, recordings[r["id"]], voc.sample_rate))
+            out, _ = vocoders.mel_energy(wav, voc)
             with np.load(os.path.join(data_dir, "segments", r["id"] + ".npz")) as d:
                 target = d["mel"].astype(np.float32)  # the recording's mel (prepare_data.py)
             n = min(out.shape[1], target.shape[1]) - 2  # not the last frames: their windows reach past the cut
@@ -252,7 +286,7 @@ def main(argv=None):
             sf.write(os.path.join(folder, r["id"] + ".wav"), generator(mel[None]).squeeze().float().cpu().numpy(),
                      voc.sample_rate, subtype="FLOAT")
         generator.train()
-        return float(np.mean(errors))
+        return {"flatness_gap": float(np.mean(gaps)), "mel": float(np.mean(errors))}
 
     reference = os.path.join(out_dir, "samples", "reference")
     if not os.path.exists(reference):
@@ -261,11 +295,12 @@ def main(argv=None):
             wav, _ = export_vocoder_audio.load(os.path.join(audio_dir, r["id"] + ".flac"))
             sf.write(os.path.join(reference, r["id"] + ".wav"), wav, voc.sample_rate, subtype="FLOAT")
     if step == 0:
-        best = evaluate()
-        history["val"].append({"step": 0, "mel": best})
+        scores = evaluate()
+        best = scores["flatness_gap"]
+        history["val"].append({"step": 0, **scores})
         save({"generator": generator.state_dict()}, os.path.join(out_dir, "bigvgan_generator.pt"))
-        print(f"  val mel {best:.4f} with the original vocoder", flush=True)
-    baseline = history["val"][0]["mel"]
+        print(f"  val flatness gap {scores['flatness_gap']:.4f}, mel {scores['mel']:.4f} with the original vocoder", flush=True)
+    baseline = history["val"][0]
 
     # 3. Training, as NVIDIA's train.py does it.
     rng = torch.Generator().manual_seed(args.seed + step)
@@ -313,13 +348,14 @@ def main(argv=None):
                       f"{rate:.2f} steps/s  ETA {(args.steps - step) / rate / 60:.0f} min", flush=True)
                 running = []
             if step % args.eval_every == 0 or step == args.steps:
-                score = evaluate()
-                history["val"].append({"step": step, "mel": score})
-                improved = score < best
+                scores = evaluate()
+                history["val"].append({"step": step, **scores})
+                improved = scores["flatness_gap"] < best
                 if improved:
-                    best = score
+                    best = scores["flatness_gap"]
                     save({"generator": generator.state_dict()}, os.path.join(out_dir, "bigvgan_generator.pt"))
-                print(f"  val mel {score:.4f} (original vocoder {baseline:.4f})"
+                print(f"  val flatness gap {scores['flatness_gap']:.4f} (original vocoder {baseline['flatness_gap']:.4f}), "
+                      f"mel {scores['mel']:.4f} ({baseline['mel']:.4f})"
                       f"{'  -> saved bigvgan_generator.pt' if improved else ''}", flush=True)
             if step % args.save_every == 0 or step == args.steps:
                 save({"generator": generator.state_dict(), "mpd": mpd.state_dict(), "mrd": mrd.state_dict(),
@@ -329,7 +365,7 @@ def main(argv=None):
                     json.dump(history, f, indent=1)
 
     rel = os.path.relpath(out_dir, REPO)
-    print(f"done at step {step}. Best val mel {best:.4f}, original vocoder {baseline:.4f}. "
+    print(f"done at step {step}. Smallest flatness gap {best:.4f}, original vocoder {baseline['flatness_gap']:.4f}. "
           f"Use it with WESPER: DECODER={rel} ./client_direct_sv.sh")
 
 

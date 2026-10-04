@@ -94,6 +94,30 @@ class Crops(unittest.TestCase):
                 np.testing.assert_allclose(audio[0].numpy().reshape(32, hop).mean(1) * 1000, mel[0].numpy(), atol=1e-3)
 
 
+class FlatnessGap(unittest.TestCase):
+    SR = 22050
+
+    def voice(self, seconds=1.0):
+        t = np.arange(int(seconds * self.SR)) / self.SR
+        return (0.1 * sum(np.sin(2 * np.pi * 150 * k * t) / k for k in range(1, 50))).astype(np.float32)
+
+    def test_zero_for_the_recording_itself(self):
+        x = self.voice()
+        self.assertAlmostEqual(ft.flatness_gap(x, x, self.SR), 0.0)
+
+    def test_grows_with_buzz(self):
+        # Noise on the harmonics makes speech flatter: the more of it, the bigger the gap.
+        x = self.voice()
+        noise = np.random.default_rng(0).standard_normal(len(x)).astype(np.float32) * 0.01
+        a, b = ft.flatness_gap(x + noise, x, self.SR), ft.flatness_gap(x + 4 * noise, x, self.SR)
+        self.assertGreater(a, 0.01)
+        self.assertGreater(b, a)
+
+    def test_ignores_level(self):
+        x = self.voice()
+        self.assertAlmostEqual(ft.flatness_gap(0.5 * x, x, self.SR), 0.0, places=4)
+
+
 class Pipeline(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -116,7 +140,7 @@ class Pipeline(unittest.TestCase):
     def test_succeeds(self):
         self.assertEqual(self.result.returncode, 0, self.result.stderr[-3000:])
         self.assertIn(f"decoder mels: {len(self.rows)} computed", self.result.stdout)
-        self.assertIn("val mel", self.result.stdout)
+        self.assertIn("val flatness gap", self.result.stdout)
         self.assertIn("done at step 4", self.result.stdout)
 
     def test_caches_the_decoders_mel_of_each_utterance(self):
@@ -154,7 +178,7 @@ class Pipeline(unittest.TestCase):
             history = json.load(f)
         self.assertEqual([v["step"] for v in history["val"]], [0, 2, 4])
         self.assertEqual([t["step"] for t in history["train"]], [4])
-        self.assertTrue(all(np.isfinite(v["mel"]) for v in history["val"]))
+        self.assertTrue(all(np.isfinite(v["mel"]) and np.isfinite(v["flatness_gap"]) for v in history["val"]))
 
     def test_writes_samples_for_each_validation(self):
         val = [r["id"] for r in self.rows if r["split"] == "val"][:ft.SAMPLES]
