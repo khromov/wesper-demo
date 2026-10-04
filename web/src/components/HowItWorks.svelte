@@ -20,19 +20,19 @@
     <li class="box model">
       <span class="step">1 · Encoder</span>
       <span class="name" data-testid="how-encoder">{encoder?.label ?? "…"}</span>
-      <span class="sub">HuBERT-soft</span>
+      <span class="sub">HuBERT-soft → speech units</span>
     </li>
-    <li class="arrow" aria-hidden="true"><span>speech units</span></li>
+    <li class="arrow" aria-hidden="true"></li>
     <li class="box model">
       <span class="step">2 · Decoder</span>
       <span class="name" data-testid="how-decoder">{decoder?.label ?? "…"}</span>
-      <span class="sub">FastSpeech2</span>
+      <span class="sub">FastSpeech2 → mel spectrogram{decoder?.melMap ? ", converted for BigVGAN" : ""}</span>
     </li>
-    <li class="arrow" aria-hidden="true"><span>{decoder?.melMap ? "mel spectrogram, converted" : "mel spectrogram"}</span></li>
+    <li class="arrow" aria-hidden="true"></li>
     <li class="box model">
       <span class="step">3 · Vocoder</span>
       <span class="name" data-testid="how-vocoder">{decoder ? vocoderLabel(decoder.vocoder) : "…"}</span>
-      <span class="sub">{decoder?.vocoderFineTuned ? "fine-tuned for this voice" : decoder?.vocoder === "bigvgan22k" ? "NVIDIA's" : "WESPER's"}</span>
+      <span class="sub">{decoder?.vocoderFineTuned ? "fine-tuned for this voice" : decoder?.vocoder === "bigvgan22k" ? "NVIDIA's" : "WESPER's"} → audio</span>
     </li>
     <li class="arrow" aria-hidden="true"></li>
     <li class="box end">
@@ -103,6 +103,15 @@
     background: var(--accent-soft);
     border-color: transparent;
   }
+  .box.end {
+    flex: 0 0 auto;
+    max-width: 84px;
+    padding: 8px 2px;
+    border: none;
+    background: none;
+    justify-content: center;
+    text-align: center;
+  }
   .step {
     font-size: 11px;
     color: var(--muted);
@@ -111,7 +120,9 @@
   }
   .name {
     font-weight: 600;
-    overflow-wrap: anywhere;
+    font-size: 14px;
+    line-height: 1.3;
+    overflow-wrap: break-word;
   }
   .sub {
     font-size: 12px;
@@ -119,7 +130,7 @@
   }
   .arrow {
     flex: none;
-    width: 76px;
+    width: 22px;
     display: flex;
     flex-direction: column;
     align-items: center;
@@ -150,14 +161,17 @@
   p {
     margin: 10px 0 0;
   }
-  @media (max-width: 640px) {
+  @media (max-width: 700px) {
     .flow {
       flex-direction: column;
     }
+    .box.end {
+      max-width: none;
+      text-align: left;
+      padding: 4px 10px;
+    }
     .arrow {
       width: auto;
-      flex-direction: row;
-      gap: 6px;
       padding: 2px 0;
     }
     .arrow::after {
