@@ -4,7 +4,7 @@ import { decodeFile, Player, resample } from "./audio/playback";
 import { microphones, Recorder } from "./audio/recorder";
 import { resolve, type BackendChoice, type Capabilities } from "./engine/backend";
 import { Engine } from "./engine/client";
-import type { ModelRef, Phase, Setup } from "./engine/protocol";
+import type { ModelRef, Phase, Setup, VoiceRef } from "./engine/protocol";
 import {
   defaultDecoder, defaultEncoder, fileUrl, parseManifest, voiceForLanguage,
   type Backend, type DecoderEntry, type EncoderEntry, type Manifest, type ModelEntry,
@@ -23,6 +23,8 @@ export interface Settings {
   backend: BackendChoice;
   /** Also list each take with the other encoder(s) and voices, converted only when asked (Generate). */
   compare: boolean;
+  /** Start playing as soon as the first chunk is converted (voices with a vocoder file, models.json version 3). */
+  stream: boolean;
   microphone: string;
 }
 
@@ -39,6 +41,8 @@ export interface Output {
   samples: Float32Array | null;
   encodeMs: number;
   decodeMs: number;
+  /** Streamed: when the first chunk was ready (playback started then, or a little later). */
+  firstMs: number | null;
   error: string;
 }
 
@@ -80,7 +84,7 @@ export class App {
   /** The last thing that went wrong, shown until dismissed. */
   error = $state("");
   notice = $state("");
-  settings = $state<Settings>({ encoder: "sv", decoder: "sv-narrator", backend: "auto", compare: false, microphone: "" });
+  settings = $state<Settings>({ encoder: "sv", decoder: "sv-narrator", backend: "auto", compare: false, stream: false, microphone: "" });
   loading = $state<Loading | null>(null);
   ready = $state(false);
   takes = $state<Take[]>([]);
@@ -94,6 +98,8 @@ export class App {
   resolved = $derived(this.caps ? resolve(this.settings.backend, this.caps) : null);
   encoder = $derived(this.manifest?.encoders.find((e) => e.id === this.settings.encoder) ?? null);
   decoder = $derived(this.manifest?.decoders.find((d) => d.id === this.settings.decoder) ?? null);
+  /** The selected voice can stream: its vocoder is a file of its own (models.json version 3). */
+  canStream = $derived(this.decoder?.vocoderId != null);
   /** The other options each take is listed with when comparing: the other encoders with the selected
    *  voice, then the other voices with the selected encoder. Each is converted only on request. */
   alternatives = $derived.by((): [EncoderEntry, DecoderEntry][] => {
@@ -142,10 +148,11 @@ export class App {
       decoder: m.decoders.some((d) => d.id === prefs.decoder) ? prefs.decoder! : defaultDecoder(m),
       backend: (["auto", "webgpu", "wasm"] as const).includes(prefs.backend!) ? prefs.backend! : "auto",
       compare: prefs.compare ?? false,
+      stream: prefs.stream ?? false,
       microphone: prefs.microphone ?? "",
     };
     // Downloads of files no longer in models.json (earlier exports) only take up space.
-    void pruneDownloads([...m.encoders, ...m.decoders].map((e) => ref(e).url)).then(async () => (this.stored = await storedBytes()));
+    void pruneDownloads([...m.encoders, ...m.vocoders, ...m.decoders].map((e) => ref(e).url)).then(async () => (this.stored = await storedBytes()));
     void this.refreshDevices();
     navigator.mediaDevices?.addEventListener?.("devicechange", () => void this.refreshDevices());
     void this.prepare();
@@ -167,7 +174,15 @@ export class App {
       // settings just aren't remembered
     }
     if ("microphone" in change) this.recorder?.close();
-    if (["encoder", "decoder", "backend"].some((k) => k in change)) void this.prepare();
+    if (["encoder", "decoder", "backend", "stream"].some((k) => k in change)) void this.prepare();
+  }
+
+  /** A voice as the worker runs it: its decoder, and its vocoder file if it has one. */
+  private voice(d: DecoderEntry): VoiceRef {
+    const v = this.manifest?.vocoders.find((x) => x.id === d.vocoderId) ?? null;
+    // plain objects: the manifest's are reactive proxies, which postMessage can't send
+    const plan = v && { firstFrames: v.stream.firstFrames, chunkFrames: v.stream.chunkFrames, contextFrames: v.stream.contextFrames };
+    return { decoder: ref(d), vocoder: v && ref(v), plan, sampleRate: d.sampleRate, hop: d.hop };
   }
 
   /** Switches to a language's voice: with the same vocoder if it has one. */
@@ -192,7 +207,8 @@ export class App {
     this.ready = false;
     try {
       // Only the selected encoder and voice: the others load when one of their outputs is generated.
-      const { notCached } = await this.engine.prepare(this.setup(), [ref(this.encoder!)], [ref(this.decoder!)], this.onProgress);
+      const { notCached } = await this.engine.prepare(this.setup(), [ref(this.encoder!)], [this.voice(this.decoder!)],
+                                                      this.settings.stream && this.canStream, this.onProgress);
       if (run === this.prepareRun) this.ready = true;
       if (notCached.length)
         this.notice = `This browser didn't let the page keep ${notCached.join(", ")} (a private window, or low on disk space?), so ${notCached.length > 1 ? "they download" : "it downloads"} again next visit.`;
@@ -309,7 +325,7 @@ export class App {
       key: `${take.id}:${first + i}:${encoder.id}:${decoder.id}`,
       encoder, decoder, backend, status: i === 0 ? "queued" : "idle",
       gainDb: encoder.targetDbfs === null ? null : normalizationGainDb(take.samples, encoder.targetDbfs, encoder.maxGainDb!),
-      samples: null, encodeMs: 0, decodeMs: 0, error: "",
+      samples: null, encodeMs: 0, decodeMs: 0, firstMs: null, error: "",
     })));
     await this.run(take, take.outputs[first], take === this.takes[0]); // the reactive copy
   }
@@ -321,14 +337,20 @@ export class App {
     await this.run(take, out, true);
   }
 
+  /** Converts an output; with play, plays it, while it's still converting when streaming. */
   private async run(take: Take, out: Output, play: boolean) {
     out.status = "running";
+    this.audio();
+    const stream = play && this.settings.stream && out.decoder.vocoderId != null ? this.player!.stream(out.key, out.decoder.sampleRate) : null;
     try {
       const input = out.gainDb === null ? take.samples : applyGain(take.samples, out.gainDb);
-      const r = await this.engine.convert({ ...this.setup(), backend: out.backend }, ref(out.encoder), ref(out.decoder), input, this.onProgress);
-      Object.assign(out, { samples: r.wav, encodeMs: r.encodeMs, decodeMs: r.decodeMs, status: "done" });
-      if (play) this.play(out.key, r.wav, out.decoder.sampleRate);
+      const r = await this.engine.convert({ ...this.setup(), backend: out.backend }, ref(out.encoder), this.voice(out.decoder), input,
+                                          this.onProgress, stream ? (c) => stream.push(c.samples, c.startAfterMs) : undefined);
+      stream?.end();
+      Object.assign(out, { samples: r.wav, encodeMs: r.encodeMs, decodeMs: r.decodeMs, firstMs: r.firstMs, status: "done" });
+      if (play && !stream) this.play(out.key, r.wav, out.decoder.sampleRate);
     } catch (e) {
+      stream?.end();
       Object.assign(out, { status: "error", error: e instanceof Error ? e.message : String(e) });
     } finally {
       this.loading = null;

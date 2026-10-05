@@ -127,6 +127,12 @@
             Compare with the other options: each take also lists the other encoder and voices, to generate when you want them
           </label>
         {/if}
+        {#if app.canStream}
+          <label class="check">
+            <input type="checkbox" checked={app.settings.stream} onchange={(e) => app.update({ stream: e.currentTarget.checked })} />
+            Stream: start playing when the first half second is converted, while the rest converts
+          </label>
+        {/if}
         <label class="mic small">
           <span class="muted">Microphone</span>
           <select value={app.settings.microphone} onchange={(e) => app.update({ microphone: e.currentTarget.value })}>

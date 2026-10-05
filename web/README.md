@@ -17,6 +17,9 @@ on WebGPU when the browser has it and WebAssembly otherwise. No audio leaves the
   and plays. With this on, it also lists the other encoder and the other voices, one change at a
   time, each with a **Generate** button: nothing more is converted or downloaded until you ask
   (BigVGAN voices are 600 MB). Generated rows play right away, and with keys `1`–`9`.
+- **Stream:** with this on, a result starts playing when its first half second is converted, and
+  the rest converts while it plays. It sounds exactly like converting it whole. With a backend
+  slower than real time (BigVGAN on WASM), playback waits just long enough not to run out.
 - **Backend:** Auto (WebGPU if available), WebGPU, or WASM.
 - **Run again** converts an earlier take with the current settings, e.g. on the other backend.
 - Each result shows its timing and the gain applied to the input. Results can be downloaded as WAV.
@@ -42,10 +45,11 @@ bigvgan22k`, see HOW_TO_TRAIN_DECODER.md). It skips any of them that's missing (
 for the other vocoder. The original encoder, the English googletts decoder, HiFi-GAN and BigVGAN
 are release files (downloaded on first use; cached by torch).
 
-The models are fp32: 378 MB per encoder, 200 MB per HiFi-GAN voice and about 600 MB per BigVGAN
-voice (BigVGAN alone is 450 MB), so 2.4 GB with both encoders and all four voices. Only the models
-the current settings use are downloaded: 578 MB for the default Swedish encoder and narrator, and
-the others when a comparison row is generated.
+The models are fp32: 378 MB per encoder, about 145 MB per voice (FastSpeech2), and its vocoder:
+55 MB for HiFi-GAN, which the HiFi-GAN voices share, and 450 MB for BigVGAN (NVIDIA's for English,
+the Swedish narrator's own fine-tuned one), so 2.3 GB in all. Only the models the current settings
+use are downloaded: 578 MB for the default Swedish encoder and narrator, and the others when a
+voice is chosen or a comparison row is generated.
 They're cached in the browser (Cache API) after the first download; the footer shows how much is
 stored, with a link to clear it. Private windows don't allow that much storage, so there they
 download on every visit, and the app says so. Files from earlier exports are deleted from the
@@ -58,10 +62,10 @@ cache on load.
 (Actions → *Web demo on GitHub Pages* → *Run workflow*). The models are too big for the repo and
 for Pages, so they live elsewhere:
 
-1. Upload all the files in `web/public/models/` to one public folder (e.g. on S3):
-   `models.json`, `encoder-sv.onnx`, `encoder-original.onnx`, `decoder-sv-narrator.onnx`,
-   `decoder-sv-narrator-bigvgan.onnx` (once the BigVGAN narrator is exported),
-   `decoder-googletts.onnx` and `decoder-googletts-bigvgan.onnx`. They must be publicly readable.
+1. Upload all the files in `web/public/models/` to one public folder (e.g. on S3): `models.json`,
+   `encoder-*.onnx` (2), `fs2-*.onnx` (one per voice) and `vocoder-*.onnx` (one per vocoder).
+   They must be publicly readable. Version 2's `decoder-*.onnx` files (FastSpeech2 and vocoder in
+   one) aren't used anymore.
    After every re-export, upload `models.json` and every file whose hash in it changed.
 2. Allow the site to read them (CORS). On S3:
    ```json
@@ -124,15 +128,25 @@ second origin with CORS (as S3 does); it also checks that the service worker giv
 | ONNX export, checked against PyTorch | `export_models.py` |
 | Models list (`models.json`), file URLs | `src/lib/models/` |
 | Inference in a Web Worker; downloads with progress and caching; warm-up | `src/lib/engine/worker.ts`, `src/lib/models/download.ts` |
+| Streaming: the vocoder's chunks, and when to start playing | `src/lib/engine/stream.ts`, `src/lib/audio/playback.ts` |
 | WebGPU or WASM | `src/lib/engine/backend.ts` |
 | Microphone (AudioWorklet), resampling to 16 kHz, playback | `src/lib/audio/` |
 | Input level normalization, a port of `speech_dbfs()` | `src/lib/audio/level.ts` |
 | State and actions | `src/lib/app.svelte.ts` |
 
 Conversion is the same as in `whisper_normal.py`: encoder (audio → 256-dim units every 20 ms),
-then FastSpeech2 and the vocoder (units → 16 kHz audio with HiFi-GAN, 22.05 kHz with BigVGAN).
-The export puts FastSpeech2 and the vocoder in one decoder file, and `models.json` gives each
-voice's vocoder, sample rate and hop. For the English voice through BigVGAN, the graph also moves the decoder's
+then FastSpeech2 (units → mel spectrogram), then the vocoder (mel spectrogram → 16 kHz audio with
+HiFi-GAN, 22.05 kHz with BigVGAN). Each is its own file, and `models.json` (version 3) gives each
+voice its vocoder, sample rate and hop.
+
+Streaming runs the encoder and FastSpeech2 on the whole take: they're cheap (FastSpeech2 is 1–7% of
+the decoding time), and their transformers use context from across the utterance, so chunks of
+them would sound different. The vocoder, which is most of the work, runs on chunks of the mel:
+first 0.5 s, then 2 s at a time, each with 0.4 s of mel on both sides. The vocoders are
+convolutional and see less than that, so the chunks join into exactly the audio of one run (the
+export checks each vocoder: 130–330 dB SNR). The chunks play back to back in an AudioContext at the
+voice's own sample rate, so nothing is resampled at the joins. Playback starts 20 ms after the first
+chunk, or later if the first chunk's speed says the rest wouldn't keep up. For the English voice through BigVGAN, the graph also moves the decoder's
 spectrogram to BigVGAN's frames and corrects each band's level in between, with the fit in
 `decoder/mel_map_hifigan16k_to_bigvgan22k.json`. An encoder trained on level-normalized audio (the Swedish one) gets its input
 normalized to the level it was trained on; the original gets it unchanged, as in the Python demo.

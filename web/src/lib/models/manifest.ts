@@ -1,5 +1,8 @@
 // models.json, written by web/export_models.py: which models exist, their files, how each
-// encoder's input level is set, and the sample rate each voice speaks at.
+// encoder's input level is set, and the sample rate each voice speaks at. Version 3 has each voice
+// as FastSpeech2 (decoders) plus a vocoder file of its own (vocoders), which the app can stream;
+// in version 2 a decoder file is both, and doesn't stream.
+import type { StreamPlan } from "../engine/stream";
 
 export type Backend = "webgpu" | "wasm";
 
@@ -22,9 +25,19 @@ export interface EncoderEntry extends ModelEntry {
   maxGainDb: number | null;
 }
 
+export interface VocoderEntry extends ModelEntry {
+  /** Which vocoder (vocoders.py): "hifigan16k", "bigvgan22k". */
+  vocoder: string;
+  sampleRate: number;
+  hop: number;
+  stream: StreamPlan;
+}
+
 export interface DecoderEntry extends ModelEntry {
   /** The language the voice speaks: "sv", "en", ... */
   language: string;
+  /** The voice's vocoder in vocoders (version 3), or null if this file makes the audio itself (version 2). */
+  vocoderId: string | null;
   /** The vocoder in the decoder's graph (vocoders.py): "hifigan16k", "bigvgan22k", ... */
   vocoder: string;
   /** The output audio's sample rate, and its samples per mel frame. */
@@ -37,12 +50,14 @@ export interface DecoderEntry extends ModelEntry {
 }
 
 export interface Manifest {
-  version: 2;
+  version: 2 | 3;
   /** The encoders' input: 16 kHz, one unit per 320 samples. */
   sampleRate: number;
   hop: number;
   maxSeconds: number;
   encoders: EncoderEntry[];
+  /** Empty in version 2. */
+  vocoders: VocoderEntry[];
   decoders: DecoderEntry[];
 }
 
@@ -74,7 +89,7 @@ function checkEntry(e: unknown, where: string): asserts e is ModelEntry {
 
 export function parseManifest(json: unknown): Manifest {
   const m = json as Partial<Manifest>;
-  if (!m || m.version !== 2) fail(`unsupported version ${m?.version}`);
+  if (!m || (m.version !== 2 && m.version !== 3)) fail(`unsupported version ${m?.version}`);
   if (m.sampleRate !== 16000 || m.hop !== 320) fail(`expected 16 kHz audio and 320-sample frames`);
   if (!(typeof m.maxSeconds === "number" && m.maxSeconds > 0)) fail("maxSeconds is missing");
   if (!m.encoders?.length) fail("no encoders");
@@ -83,16 +98,34 @@ export function parseManifest(json: unknown): Manifest {
     checkEntry(e, `encoder ${i}`);
     if ((e.targetDbfs === null) !== (e.maxGainDb === null)) fail(`encoder ${e.id} needs both targetDbfs and maxGainDb, or neither`);
   });
+  const positive = (x: unknown) => Number.isInteger(x) && (x as number) > 0;
+  if (m.version === 3 && !m.vocoders?.length) fail("no vocoders");
+  m.vocoders = m.version === 2 ? [] : m.vocoders!.map((v, i) => {
+    checkEntry(v, `vocoder ${i}`);
+    const p = v.stream;
+    if (typeof v.vocoder !== "string" || !positive(v.sampleRate) || !positive(v.hop))
+      fail(`vocoder ${v.id} needs a vocoder, a sampleRate and a hop`);
+    if (!p || !positive(p.firstFrames) || !positive(p.chunkFrames) || !(Number.isInteger(p.contextFrames) && p.contextFrames >= 0))
+      fail(`vocoder ${v.id} has no stream plan`);
+    return { ...v, description: v.description ?? "" };
+  });
+  const vocoders = m.vocoders;
   m.decoders = m.decoders.map((d, i) => {
     checkEntry(d, `decoder ${i}`);
     // models.json from before voices had a language: WESPER's English one, or the Swedish narrator
     const o = d as Partial<DecoderEntry>;
     const v = { ...HIFIGAN16K, ...d, language: o.language ?? (d.id.startsWith("googletts") ? "en" : "sv"),
+                vocoderId: m.version === 3 ? (o.vocoderId ?? "") : null,
                 vocoderFineTuned: o.vocoderFineTuned === true, melMap: o.melMap === true };
-    const positive = (x: unknown) => Number.isInteger(x) && (x as number) > 0;
     if (typeof v.vocoder !== "string" || !positive(v.sampleRate) || !positive(v.hop))
       fail(`decoder ${d.id} needs a vocoder, a sampleRate and a hop`);
     if (typeof v.language !== "string" || !v.language) fail(`decoder ${d.id} has no language`);
+    if (v.vocoderId !== null) {
+      const voc = vocoders.find((x) => x.id === v.vocoderId);
+      if (!voc) fail(`decoder ${d.id}'s vocoder ${v.vocoderId || "(none)"} isn't in vocoders`);
+      if (voc.vocoder !== v.vocoder || voc.sampleRate !== v.sampleRate || voc.hop !== v.hop)
+        fail(`decoder ${d.id} doesn't match its vocoder ${voc.id}`);
+    }
     return v;
   });
   return m as Manifest;

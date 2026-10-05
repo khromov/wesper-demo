@@ -2,8 +2,15 @@
 
 Writes into web/public/models/ (by default):
   encoder-<id>.onnx         audio [1, T] float32, 16 kHz -> soft units [1, T // 320, 256]
-  decoder-<id>.onnx         soft units -> audio [1, S] float32 (FastSpeech2 + its vocoder), one per voice
-  models.json               what the app loads: labels, files, sizes, hashes and each encoder's input level
+  fs2-<id>.onnx             soft units -> mel spectrogram [1, n_mels, F] for the voice's vocoder (FastSpeech2), one per voice
+  vocoder-<id>.onnx         mel spectrogram -> audio [1, S] float32, one per vocoder, shared by the voices using it
+  models.json               what the app loads (version 3): labels, files, sizes, hashes, each encoder's input
+                            level, and how to stream each vocoder
+
+The vocoders are separate files so the app can stream: FastSpeech2 runs on the whole take, then the
+vocoder on chunks of its mel, each with STREAM_CONTEXT_SECONDS of mel on both sides, and the first
+chunk plays while the rest convert. The vocoders are convolutional, so with that much context the
+chunks join into the same audio as one run over the whole mel; the script checks this.
 
 The models stay fp32: fp16 versions were tried and sounded clearly worse in the browser.
 
@@ -164,19 +171,19 @@ def fixed_bigvgan_filters(vocoder, n_mels):
     return len(channels)
 
 
-class DecoderExport(nn.Module):
-    """soft units [1, N, 256] -> wav [1, S]: FastSpeech2's inference path as units2wav() runs it
-    (no targets: predicted pitch, energy and durations), then the vocoder (voc). Batch 1, no
-    padding. For vocoders with other frame rates, the units are first moved to its frames.
+class MelExport(nn.Module):
+    """soft units [1, N, 256] -> mel [1, n_mels, F] for the vocoder voc: FastSpeech2's inference path
+    as units2wav() runs it (no targets: predicted pitch, energy and durations). Batch 1, no padding.
+    For vocoders with other frame rates, the units are first moved to its frames.
 
     With mel_map (a, c per band), the decoder was trained for HiFi-GAN but voc is BigVGAN: it runs
     at HiFi-GAN's frames, and its mel is moved to voc's frames and corrected, a * mel + c, as
     decoder/bigvgan_preview.py does."""
 
-    def __init__(self, fs2, vocoder, voc=vocoders.HIFIGAN16K, mel_map=None):
+    def __init__(self, fs2, voc=vocoders.HIFIGAN16K, mel_map=None):
         super().__init__()
         assert isinstance(fs2.encoder.src_word_emb, nn.Identity), "expects 256-dim soft units (soft_unit_dim 256)"
-        self.fs2, self.vocoder, self.voc, self.mapped = fs2, vocoder, voc, mel_map is not None
+        self.fs2, self.voc, self.mapped = fs2, voc, mel_map is not None
         d = fs2.encoder.d_model
         frames = vocoders.n_frames(MAX_SECONDS * SR // HOP, vocoders.HIFIGAN16K if self.mapped else voc)
         self.register_buffer("pos", get_sinusoid_encoding_table(frames + 1, d)[None])
@@ -207,7 +214,70 @@ class DecoderExport(nn.Module):
         mel = self.fs2.postnet(mel) + mel
         if self.mapped:  # a HiFi-GAN mel, at the vocoder's frames, each band's level corrected
             mel = units_to_frames(mel, self.voc) * self.map_a + self.map_c
-        return self.vocoder(mel.transpose(1, 2)).squeeze(1)
+        return mel.transpose(1, 2)
+
+
+class VocoderExport(nn.Module):
+    """mel [1, n_mels, F] -> wav [1, S]: the vocoder, batch 1."""
+
+    def __init__(self, vocoder):
+        super().__init__()
+        self.vocoder = vocoder
+
+    def forward(self, mel):
+        return self.vocoder(mel).squeeze(1)
+
+
+class DecoderExport(nn.Module):
+    """soft units [1, N, 256] -> wav [1, S]: MelExport, then the vocoder, in one graph. The app runs
+    the two halves as separate files (fs2-*.onnx, vocoder-*.onnx); this is the whole for the tests."""
+
+    def __init__(self, fs2, vocoder, voc=vocoders.HIFIGAN16K, mel_map=None):
+        super().__init__()
+        self.mel, self.vocoder = MelExport(fs2, voc, mel_map), VocoderExport(vocoder)
+
+    def forward(self, units):
+        return self.vocoder(self.mel(units))
+
+
+# ---------------------------------------------------------------- streaming
+
+STREAM_FIRST_SECONDS = 0.5  # the first chunk: short, so playback starts soon
+STREAM_CHUNK_SECONDS = 2.0  # the others: long, so the context costs little
+STREAM_CONTEXT_SECONDS = 0.4  # mel on each side of a chunk; covers the vocoders' receptive fields
+
+
+def stream_plan(voc):
+    """How the app streams a vocoder, in its mel frames (models.json)."""
+    frames = lambda seconds: int(np.ceil(seconds * voc.sample_rate / voc.hop))
+    return {"firstFrames": frames(STREAM_FIRST_SECONDS), "chunkFrames": frames(STREAM_CHUNK_SECONDS),
+            "contextFrames": frames(STREAM_CONTEXT_SECONDS)}
+
+
+def stream_windows(frames, plan):
+    """The vocoder runs for a mel of `frames` frames, as the app makes them (src/lib/engine/stream.ts):
+    (a, b, s, e) per chunk, which plays mel frames [a, b) and runs the vocoder on [s, e). The first
+    chunk runs on [0, first + context); the others on chunk + 2 * context frames, shifted back at the
+    end so their size (and on WebGPU, their compiled shaders) stays the same."""
+    first, chunk, k = plan["firstFrames"], plan["chunkFrames"], plan["contextFrames"]
+    out, a = [], 0
+    while a < frames:
+        b = min(frames, a + (first if a == 0 else chunk))
+        e = min(frames, b + k)
+        s = 0 if a == 0 else max(0, min(a - k, e - (chunk + 2 * k)))
+        out.append((a, b, s, e))
+        a = b
+    return out
+
+
+def stream_join(run, mel, plan, hop):
+    """Audio for mel [1, n_mels, F] from the vocoder run(mel window) in the app's chunks."""
+    frames = mel.shape[2]
+    parts = []
+    for a, b, s, e in stream_windows(frames, plan):
+        wav = run(mel[:, :, s:e])[0]
+        parts.append(wav[(a - s) * hop:] if b == frames else wav[(a - s) * hop:(b - s) * hop])
+    return np.concatenate(parts)
 
 
 # ---------------------------------------------------------------- reference (the original code path)
@@ -236,10 +306,10 @@ def reference_wav(fs2, vocoder, units, voc=vocoders.HIFIGAN16K, mel_map=None):
 
 # ---------------------------------------------------------------- export and checks
 
-def export(module, example, path, input_name, output_name, axis_names):
+def export(module, example, path, input_name, output_name, axis_names, axes=(1, 1)):
     torch.onnx.export(module, (example,), path, opset_version=OPSET, input_names=[input_name],
                       output_names=[output_name],
-                      dynamic_axes={input_name: {1: axis_names[0]}, output_name: {1: axis_names[1]}})
+                      dynamic_axes={input_name: {axes[0]: axis_names[0]}, output_name: {axes[1]: axis_names[1]}})
 
 
 def session(path):
@@ -271,13 +341,30 @@ def check_encoder(path, wav, ref_units):
     return {"unitsCosine": round(cos, 6)}
 
 
-def check_decoder(path, units, ref):
-    wav = session(path).run(None, {"units": units})[0][0]
-    assert len(wav) == len(ref), f"{path}: {len(wav)} samples, PyTorch gives {len(ref)}"
-    assert np.isfinite(wav).all(), f"{path}: non-finite samples"
+def check_wav(what, wav, ref):
+    assert len(wav) == len(ref), f"{what}: {len(wav)} samples, PyTorch gives {len(ref)}"
+    assert np.isfinite(wav).all(), f"{what}: non-finite samples"
     snr = snr_db(ref, wav)
-    assert snr >= MIN_SNR_DB, f"{path}: SNR {snr:.1f} dB vs PyTorch"
+    assert snr >= MIN_SNR_DB, f"{what}: SNR {snr:.1f} dB vs PyTorch"
     return {"snrDb": round(snr, 1)}
+
+
+def check_voice(fs2_path, vocoder_path, units_list, refs):
+    """A voice's two files, units -> mel -> audio, against the PyTorch code path, on each input."""
+    fs2, vocoder = session(fs2_path), session(vocoder_path)
+    return [check_wav(os.path.basename(fs2_path), vocoder.run(None, {"mel": fs2.run(None, {"units": u})[0]})[0][0], r)
+            for u, r in zip(units_list, refs)]
+
+
+def check_stream(vocoder_path, mel, plan, hop):
+    """The vocoder on the app's chunks joins into the audio of one run over the whole mel."""
+    vocoder = session(vocoder_path)
+    run = lambda m: vocoder.run(None, {"mel": np.ascontiguousarray(m)})[0]
+    full, joined = run(mel)[0], stream_join(run, mel, plan, hop)
+    assert len(joined) == len(full), f"{vocoder_path}: streamed {len(joined)} samples, {len(full)} in one run"
+    snr = snr_db(full, joined)
+    assert snr >= MIN_SNR_DB, f"{vocoder_path}: streamed audio {snr:.1f} dB from one run's"
+    return {"streamSnrDb": round(snr, 1), "chunks": len(stream_windows(mel.shape[2], plan))}
 
 
 def load_configs():
@@ -316,14 +403,31 @@ def export_encoder(hubert, eid, out, clips, log):
     return info, checks
 
 
-def export_decoder(fs2, vocoder, did, out, units_list, log, voc=vocoders.HIFIGAN16K, mel_map=None):
-    refs = [reference_wav(fs2, vocoder, torch.tensor(u), voc, mel_map).numpy() for u in units_list]
-    path = os.path.join(out, f"decoder-{did}.onnx")
-    export(DecoderExport(fs2, vocoder, voc, mel_map).eval(), torch.tensor(units_list[0]), path, "units", "wav", ("frames", "samples"))
-    checks = [check_decoder(path, u, r) for u, r in zip(units_list, refs)]
+def export_vocoder(vocoder, vid, out, mel, log, voc=vocoders.HIFIGAN16K):
+    """vocoder-<vid>.onnx: mel -> audio, checked against PyTorch and for streaming, on mel [1, n_mels, F]
+    (a voice's mel for the longer test clip, so that it streams in several chunks)."""
+    path = os.path.join(out, f"vocoder-{vid}.onnx")
+    module = VocoderExport(vocoder).eval()
+    export(module, torch.from_numpy(mel), path, "mel", "wav", ("mel_frames", "samples"), axes=(2, 1))
+    checks = [check_wav(os.path.basename(path), session(path).run(None, {"mel": mel})[0][0], module(torch.from_numpy(mel))[0].numpy()),
+              check_stream(path, mel, stream_plan(voc), voc.hop)]
     info = file_info(path)
     log(f"  {info['path']}: {info['bytes'] / 1e6:.0f} MB, {checks}")
     return info, checks
+
+
+def export_voice(fs2, did, out, units_list, log, voc, mel_map, vocoder, vocoder_path):
+    """fs2-<did>.onnx: units -> the vocoder's mel, checked with the vocoder's file against PyTorch."""
+    refs = [reference_wav(fs2, vocoder, torch.tensor(u), voc, mel_map).numpy() for u in units_list]
+    path = os.path.join(out, f"fs2-{did}.onnx")
+    export(MelExport(fs2, voc, mel_map).eval(), torch.tensor(units_list[0]), path, "units", "mel", ("frames", "mel_frames"), axes=(1, 2))
+    checks = check_voice(path, vocoder_path, units_list, refs)
+    info = file_info(path)
+    log(f"  {info['path']}: {info['bytes'] / 1e6:.0f} MB, {checks}")
+    return info, checks
+
+
+VOCODER_LABELS = {"hifigan16k": "HiFi-GAN 16 kHz", "bigvgan22k": "BigVGAN 22 kHz"}
 
 
 DECODERS = {  # id -> what the app shows (language, label, description) and the vocoder; in this order
@@ -393,8 +497,8 @@ def main(argv=None):
     log = lambda s: print(s, flush=True)
     try:
         clips = test_clips()
-        manifest = {"version": 2, "sampleRate": SR, "hop": HOP, "maxSeconds": MAX_SECONDS,
-                    "encoders": [], "decoders": []}
+        manifest = {"version": 3, "sampleRate": SR, "hop": HOP, "maxSeconds": MAX_SECONDS,
+                    "encoders": [], "vocoders": [], "decoders": []}
         units_for_decoder = None
         for eid in ("sv", "original"):
             src = sources[eid]
@@ -458,12 +562,23 @@ def main(argv=None):
                 source.append(os.path.relpath(os.path.abspath(args.en_bigvgan_map), REPO))
             log(f"### decoder {did}: {source[0]} + {voc.name}" + (" (mel map)" if mel_map is not None else ""))
             fs2 = wn.load_fastspeech2(cfg, checkpoint_path=checkpoint, device="cpu")
-            info, checks = export_decoder(fs2, vocoder_for(voc, voc_checkpoint), did, out, units_for_decoder, log, voc, mel_map)
+            vocoder = vocoder_for(voc, voc_checkpoint)
+            vid = did if voc_checkpoint else voc.name  # a run's own vocoder is its alone; the released ones are shared
+            if not any(v["id"] == vid for v in manifest["vocoders"]):
+                log(f"### vocoder {vid}: {source[1]}")
+                mel = MelExport(fs2, voc, mel_map).eval()(torch.tensor(units_for_decoder[-1])).numpy()
+                info, checks = export_vocoder(vocoder, vid, out, mel, log, voc)
+                manifest["vocoders"].append({
+                    "id": vid, "label": VOCODER_LABELS.get(voc.name, voc.name) + (f", fine-tuned for {DECODERS[did]['label']}" if voc_checkpoint else ""),
+                    "vocoder": voc.name, "sampleRate": voc.sample_rate, "hop": voc.hop, "stream": stream_plan(voc),
+                    "source": source[1], "file": info, "checks": checks})
+            info, checks = export_voice(fs2, did, out, units_for_decoder, log, voc, mel_map, vocoder,
+                                        os.path.join(out, f"vocoder-{vid}.onnx"))
             entry = DECODERS[did]
             description = entry["description"] + (". Its BigVGAN is fine-tuned on this decoder's own output, which reduces"
                                                    " its electric buzz (decoder/finetune_vocoder.py)" if voc_checkpoint else "")
             manifest["decoders"].append({"id": did, "language": entry["language"], "label": entry["label"], "description": description,
-                                         "vocoder": voc.name, "sampleRate": voc.sample_rate, "hop": voc.hop,
+                                         "vocoder": voc.name, "vocoderId": vid, "sampleRate": voc.sample_rate, "hop": voc.hop,
                                          # for the app's how-it-works diagram: the run's own vocoder, or the mel map
                                          "vocoderFineTuned": bool(voc_checkpoint), "melMap": mel_map is not None,
                                          "source": source, "file": info, "checks": checks})
@@ -472,6 +587,12 @@ def main(argv=None):
         with open(os.path.join(out, "models.json"), "w") as f:
             json.dump(manifest, f, indent=2)
         log(f"### wrote {out}/models.json")
+        # Files from earlier exports (e.g. version 2's decoder-*.onnx, FastSpeech2 and vocoder in one)
+        current = {e["file"]["path"] for e in manifest["encoders"] + manifest["vocoders"] + manifest["decoders"]}
+        for name in sorted(os.listdir(out)):
+            if name.endswith(".onnx") and name not in current:
+                os.remove(os.path.join(out, name))
+                log(f"### removed {name}, from an earlier export")
     finally:
         os.chdir(cwd)
         faulthandler.cancel_dump_traceback_later()

@@ -8,6 +8,8 @@
 //   - Every voice in models.json can be chosen by language and output model, and converts at its
 //     own sample rate (BigVGAN's 22.05 kHz too), on WASM and WebGPU, which agree; the voices differ.
 //   - "How it works" starts collapsed, and opened shows the selected encoder, voice and vocoder.
+//   - Streaming a longer take plays before its conversion is done, and gives the same audio as
+//     converting it whole, with HiFi-GAN and with BigVGAN.
 //   - Old downloads are cleaned up, and a private window says it can't keep the models.
 //
 //   bun run test:e2e            # against the dev server (needs the models: see README.md)
@@ -22,7 +24,8 @@ import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { chromium, type Page } from "playwright-core";
-import { decodeWav } from "../src/lib/audio/wav";
+import { writeFileSync } from "node:fs";
+import { decodeWav, encodeWav } from "../src/lib/audio/wav";
 
 const WEB = join(import.meta.dir, "..");
 const SAMPLE = join(WEB, "..", "sample_whisper.wav");
@@ -394,7 +397,9 @@ try {
   console.log("persistence and cache cleanup");
   const cached = () => page.evaluate(async () => (await (await caches.open("wesper-models-v1")).keys()).map((r) => new URL(r.url).pathname));
   const before = await cached();
-  check(before.length === 3, `only the three models used are cached, not the voices left unconverted (${before.join(", ")})`);
+  const used = ["encoder-sv", "encoder-original", "fs2-sv-narrator", "vocoder-hifigan16k"];
+  check(before.length === used.length && used.every((m) => before.some((p) => p.includes(m))),
+        `only the models used are cached, not the voices left unconverted (${before.join(", ")})`);
   await page.evaluate(() => caches.open("wesper-models-v1").then((c) => c.put("/models/encoder-sv.fp16.onnx?v=old", new Response("old"))));
   await page.reload();
   await waitForReady(page);
@@ -442,6 +447,43 @@ try {
   for (let i = 0; i < order.length; i++) {
     const agree = await snr(page, voiceTake, i, order.length + i);
     check(agree > 50, `WebGPU and WASM agree (${voicePairs[i]}: ${agree.toFixed(1)} dB SNR)`);
+  }
+
+  console.log("streaming");
+  const sample = decodeWav(readFileSync(SAMPLE)).samples;
+  const long = new Float32Array(sample.length * 4).map((_, i) => sample[i % sample.length]); // 7.6 s: several chunks
+  const longFile = join(profile, "long-whisper.wav");
+  writeFileSync(longFile, encodeWav(long, 16000));
+  await page.getByLabel(/Stream: start playing/).check();
+  for (const v of [VOICES.find((d) => d.id === "sv-narrator")!, VOICES.find((d) => d.vocoder === "bigvgan22k")!]) {
+    await chooseVoice(page, v);
+    await waitForReady(page);
+    const count: number = await page.evaluate(() => (window as any).__wesper.takes.length);
+    await page.getByTestId("file").setInputFiles(longFile);
+    await page.waitForFunction((n) => (window as any).__wesper.takes.length > n, count, { timeout: STEP_MS });
+    const id: number = await page.evaluate(() => (window as any).__wesper.takes[0].id);
+    const playedEarly = page.waitForFunction(() => {
+      const app = (window as any).__wesper;
+      const out = app.takes[0].outputs[0];
+      return app.playing === out.key && out.status !== "done";
+    }, null, { timeout: STEP_MS, polling: 20 }).then(() => true, () => false);
+    t = await waitForOutputs(page, id, 1);
+    checkTake(t, "webgpu", 0, [`sv:${v.id}`]);
+    const o = await page.evaluate(() => {
+      const out = (window as any).__wesper.takes[0].outputs[0];
+      return { firstMs: out.firstMs, totalMs: out.encodeMs + out.decodeMs };
+    });
+    check(o.firstMs !== null && o.firstMs < o.totalMs,
+          `${v.id}: streamed, the first chunk after ${(o.firstMs / 1000).toFixed(2)} s of ${(o.totalMs / 1000).toFixed(2)} s`);
+    check(await playedEarly, `${v.id}: it was playing before the conversion finished`);
+    await page.getByLabel(/Stream: start playing/).uncheck();
+    await waitForReady(page);
+    await page.locator(`[data-take="${id}"]`).getByRole("button", { name: "Run again" }).click();
+    t = await waitForOutputs(page, id, 2);
+    check(t.outputs[1].samples === t.outputs[0].samples, `${v.id}: as long as converting it whole (${t.outputs[0].samples} samples)`);
+    const same = await snr(page, id, 1, 0);
+    check(same > 50, `${v.id}: the same audio as converting it whole (${same.toFixed(1)} dB SNR)`);
+    await page.getByLabel(/Stream: start playing/).check();
   }
 
   check(consoleErrors.length === 0, `no console errors${consoleErrors.length ? `: ${consoleErrors.join(" | ")}` : ""}`);

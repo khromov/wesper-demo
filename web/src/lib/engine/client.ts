@@ -1,9 +1,9 @@
 // The page's side of the inference worker: one promise per request, plus progress callbacks.
 import type { Capabilities } from "./backend";
-import type { ConvertResult, ModelRef, Phase, PrepareResult, Request, Response, Setup } from "./protocol";
+import type { Chunk, ConvertResult, ModelRef, Phase, PrepareResult, Request, Response, Setup, VoiceRef } from "./protocol";
 
 export type Progress = (name: string, phase: Phase, loaded: number, total: number) => void;
-type Pending = { resolve: (v: unknown) => void; reject: (e: Error) => void; onProgress?: Progress };
+type Pending = { resolve: (v: unknown) => void; reject: (e: Error) => void; onProgress?: Progress; onChunk?: (c: Chunk) => void };
 type Body<T> = T extends unknown ? Omit<T, "id"> : never;
 
 export class Engine {
@@ -17,6 +17,7 @@ export class Engine {
       const p = this.pending.get(msg.id);
       if (!p) return;
       if (msg.type === "progress") return p.onProgress?.(msg.name, msg.phase, msg.loaded, msg.total);
+      if (msg.type === "chunk") return p.onChunk?.(msg);
       this.pending.delete(msg.id);
       if (msg.type === "done") p.resolve(msg.result);
       else p.reject(new Error(msg.message));
@@ -27,10 +28,10 @@ export class Engine {
     };
   }
 
-  private call<T>(body: Body<Request>, onProgress?: Progress, transfer: Transferable[] = []): Promise<T> {
+  private call<T>(body: Body<Request>, onProgress?: Progress, transfer: Transferable[] = [], onChunk?: (c: Chunk) => void): Promise<T> {
     const id = this.nextId++;
     return new Promise<T>((resolve, reject) => {
-      this.pending.set(id, { resolve: resolve as (v: unknown) => void, reject, onProgress });
+      this.pending.set(id, { resolve: resolve as (v: unknown) => void, reject, onProgress, onChunk });
       this.worker.postMessage({ ...body, id }, transfer);
     });
   }
@@ -39,13 +40,14 @@ export class Engine {
     return this.call({ type: "capabilities" });
   }
 
-  prepare(setup: Setup, encoders: ModelRef[], decoders: ModelRef[], onProgress?: Progress): Promise<PrepareResult> {
-    return this.call({ type: "prepare", setup, encoders, decoders }, onProgress);
+  prepare(setup: Setup, encoders: ModelRef[], voices: VoiceRef[], stream: boolean, onProgress?: Progress): Promise<PrepareResult> {
+    return this.call({ type: "prepare", setup, encoders, voices, stream }, onProgress);
   }
 
-  /** Converts 16 kHz audio. `wav` is copied, so the caller keeps its array. */
-  convert(setup: Setup, encoder: ModelRef, decoder: ModelRef, wav: Float32Array, onProgress?: Progress): Promise<ConvertResult> {
+  /** Converts 16 kHz audio. `wav` is copied, so the caller keeps its array. With onChunk (and a voice
+   *  that can stream), the audio also comes in chunks as it's made. */
+  convert(setup: Setup, encoder: ModelRef, voice: VoiceRef, wav: Float32Array, onProgress?: Progress, onChunk?: (c: Chunk) => void): Promise<ConvertResult> {
     const copy = new Float32Array(wav);
-    return this.call({ type: "convert", setup, encoder, decoder, wav: copy }, onProgress, [copy.buffer]);
+    return this.call({ type: "convert", setup, encoder, voice, wav: copy, stream: !!onChunk }, onProgress, [copy.buffer], onChunk);
   }
 }

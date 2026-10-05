@@ -4,12 +4,14 @@
 import * as ort from "onnxruntime-web";
 import { download } from "../models/download";
 import type { Capabilities } from "./backend";
-import type { ConvertResult, ModelRef, Phase, Request, Response, Setup } from "./protocol";
+import type { Chunk, ConvertResult, ModelRef, Phase, Request, Response, Setup, VoiceRef } from "./protocol";
+import { chunkSamples, melWindow, startDelayMs, streamWindows, windowSizes } from "./stream";
 
 declare const self: DedicatedWorkerGlobalScope;
 
 const sessions = new Map<string, Promise<ort.InferenceSession>>(); // key(): setup + url
 const warmed = new Set<string>();
+const melBands = new Map<string, number>(); // vocoder key -> its mel's bands, once seen
 const notCached = new Set<string>(); // names of models the browser wouldn't store
 
 const post = (msg: Response, transfer: Transferable[] = []) => self.postMessage(msg, transfer);
@@ -74,29 +76,95 @@ function session(setup: Setup, model: ModelRef, id: number): Promise<ort.Inferen
   return s;
 }
 
-async function run(enc: ort.InferenceSession, dec: ort.InferenceSession, wav: Float32Array): Promise<ConvertResult> {
-  const t0 = performance.now();
-  const { units } = await enc.run({ wav: new ort.Tensor("float32", wav, [1, wav.length]) });
-  const t1 = performance.now();
-  const out = await dec.run({ units });
-  const t2 = performance.now();
-  const result = { wav: new Float32Array(out.wav.data as Float32Array), encodeMs: t1 - t0, decodeMs: t2 - t1 };
-  units.dispose();
-  out.wav.dispose();
-  return result;
+interface Loaded {
+  enc: ort.InferenceSession;
+  dec: ort.InferenceSession;
+  /** The voice's vocoder (models.json version 3); null if the decoder makes the audio itself (version 2). */
+  voc: ort.InferenceSession | null;
 }
 
-/** Sessions for an encoder and the decoder. The first run compiles GPU shaders (seconds), so a
- *  new pair runs once on a second of silence before it's used. */
-async function pair(setup: Setup, encoder: ModelRef, decoder: ModelRef, id: number) {
-  const [enc, dec] = [await session(setup, encoder, id), await session(setup, decoder, id)];
-  const [ke, kd] = [key(setup, encoder), key(setup, decoder)];
-  if (!warmed.has(ke) || !warmed.has(kd)) {
-    progress(id, encoder.name, "warm up");
-    await run(enc, dec, new Float32Array(16000));
-    warmed.add(ke).add(kd);
+function concat(parts: Float32Array[]): Float32Array {
+  const out = new Float32Array(parts.reduce((n, p) => n + p.length, 0));
+  parts.reduce((at, p) => (out.set(p, at), at + p.length), 0);
+  return out;
+}
+
+/** Encoder, then decoder (units -> mel), then vocoder (mel -> audio). With onChunk and a vocoder of its
+ *  own, the vocoder runs on chunks of the mel (stream.ts), each passed on as soon as it's made. */
+async function run(m: Loaded, voice: VoiceRef, wav: Float32Array, onChunk?: (c: Chunk) => void): Promise<ConvertResult & { bands: number }> {
+  const t0 = performance.now();
+  const { units } = await m.enc.run({ wav: new ort.Tensor("float32", wav, [1, wav.length]) });
+  const t1 = performance.now();
+  const out = await m.dec.run({ units });
+  units.dispose();
+  if (!m.voc) {
+    const result = new Float32Array(out.wav.data as Float32Array);
+    out.wav.dispose();
+    return { wav: result, encodeMs: t1 - t0, decodeMs: performance.now() - t1, firstMs: null, bands: 0 };
   }
-  return [enc, dec] as const;
+  const mel = out.mel;
+  const [, bands, frames] = mel.dims as number[];
+  let result: Float32Array;
+  let firstMs: number | null = null;
+  if (!onChunk || !voice.plan) {
+    const { wav: w } = await m.voc.run({ mel });
+    result = new Float32Array(w.data as Float32Array);
+    w.dispose();
+  } else {
+    const data = mel.data as Float32Array;
+    const windows = streamWindows(frames, voice.plan);
+    const parts: Float32Array[] = [];
+    for (const [i, w] of windows.entries()) {
+      const started = performance.now();
+      const input = new ort.Tensor("float32", melWindow(data, bands, frames, w.s, w.e), [1, bands, w.e - w.s]);
+      const { wav: o } = await m.voc.run({ mel: input });
+      const samples = chunkSamples(o.data as Float32Array, w, frames, voice.hop).slice();
+      input.dispose();
+      o.dispose();
+      let startAfterMs = 0;
+      if (i === 0) {
+        firstMs = performance.now() - t0;
+        startAfterMs = startDelayMs(windows, performance.now() - started, voice.hop, voice.sampleRate);
+      }
+      parts.push(samples);
+      onChunk({ samples, index: i, count: windows.length, startAfterMs });
+    }
+    result = concat(parts);
+  }
+  mel.dispose();
+  return { wav: result, encodeMs: t1 - t0, decodeMs: performance.now() - t1, firstMs, bands };
+}
+
+/** Sessions for an encoder and a voice. The first run compiles GPU shaders (seconds), so a new set runs
+ *  once on a second of silence before it's used; for streaming on WebGPU, the vocoder also runs on its
+ *  window sizes, so that compiling them doesn't hold up the first stream. */
+async function load(setup: Setup, encoder: ModelRef, voice: VoiceRef, id: number, stream: boolean): Promise<Loaded> {
+  const m: Loaded = {
+    enc: await session(setup, encoder, id),
+    dec: await session(setup, voice.decoder, id),
+    voc: voice.vocoder ? await session(setup, voice.vocoder, id) : null,
+  };
+  const keys = [encoder, voice.decoder, ...(voice.vocoder ? [voice.vocoder] : [])].map((r) => key(setup, r));
+  if (keys.some((k) => !warmed.has(k))) {
+    progress(id, encoder.name, "warm up");
+    const { bands } = await run(m, voice, new Float32Array(16000));
+    if (voice.vocoder) melBands.set(key(setup, voice.vocoder), bands);
+    keys.forEach((k) => warmed.add(k));
+  }
+  if (stream && m.voc && voice.vocoder && voice.plan && setup.backend === "webgpu") {
+    const k = key(setup, voice.vocoder);
+    if (!warmed.has(k + "|stream")) {
+      progress(id, voice.vocoder.name, "warm up");
+      const bands = melBands.get(k) ?? (await run(m, voice, new Float32Array(16000))).bands;
+      for (const n of windowSizes(voice.plan)) {
+        const mel = new ort.Tensor("float32", new Float32Array(bands * n).fill(-11.5), [1, bands, n]); // silence
+        (await m.voc.run({ mel })).wav.dispose();
+        mel.dispose();
+      }
+      warmed.add(k + "|stream");
+    }
+  }
+  return m;
 }
 
 async function handle(req: Request) {
@@ -105,12 +173,13 @@ async function handle(req: Request) {
       post({ id: req.id, type: "done", result: await capabilities() });
     } else if (req.type === "prepare") {
       await useSetup(req.setup);
-      for (const encoder of req.encoders) for (const decoder of req.decoders) await pair(req.setup, encoder, decoder, req.id);
+      for (const encoder of req.encoders) for (const voice of req.voices) await load(req.setup, encoder, voice, req.id, req.stream);
       post({ id: req.id, type: "done", result: { notCached: [...notCached] } });
     } else {
       await useSetup(req.setup);
-      const [enc, dec] = await pair(req.setup, req.encoder, req.decoder, req.id);
-      const result = await run(enc, dec, req.wav);
+      const m = await load(req.setup, req.encoder, req.voice, req.id, req.stream);
+      const onChunk = req.stream ? (c: Chunk) => post({ id: req.id, type: "chunk", ...c }) : undefined;
+      const { bands: _, ...result } = await run(m, req.voice, req.wav, onChunk);
       post({ id: req.id, type: "done", result }, [result.wav.buffer]);
     }
   } catch (e) {

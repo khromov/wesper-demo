@@ -186,6 +186,40 @@ class AgainstCheckpoints(unittest.TestCase):
         torch.testing.assert_close(wav, em.reference_wav(self.fs2, self.vocoder, units), atol=1e-5, rtol=0)
 
 
+class Streaming(unittest.TestCase):
+    """The app streams a voice by running its vocoder on chunks of the mel, with context on both sides."""
+    PLAN = {"firstFrames": 25, "chunkFrames": 100, "contextFrames": 20}  # HiFi-GAN 16 kHz's (stream_plan)
+
+    def test_plan_is_in_frames_of_each_vocoder(self):
+        self.assertEqual(em.stream_plan(em.vocoders.HIFIGAN16K), self.PLAN)
+        self.assertEqual(em.stream_plan(BIGVGAN22K), {"firstFrames": 44, "chunkFrames": 173, "contextFrames": 35})
+
+    def test_chunks_play_every_frame_once_in_order(self):
+        k = self.PLAN["contextFrames"]
+        for frames in (1, 24, 25, 26, 44, 45, 125, 140, 141, 300, 1001):
+            w = em.stream_windows(frames, self.PLAN)
+            self.assertEqual([a for a, *_ in w], [0] + [b for _, b, *_ in w[:-1]], frames)
+            self.assertEqual(w[-1][1], frames)
+            for a, b, s, e in w:
+                self.assertTrue(0 <= s <= a < b <= e <= frames, (frames, a, b, s, e))
+                self.assertGreaterEqual(a - s, min(k, a))  # context before, except at the start
+                self.assertGreaterEqual(e - b, min(k, frames - b))  # and after, except at the end
+            if frames >= 100 + 2 * k:  # long enough: all but the first run on the same size
+                self.assertEqual({e - s for _, _, s, e in w[1:]}, {100 + 2 * k}, frames)
+
+    def test_a_streamed_vocoder_joins_into_one_run(self):
+        import hifigan
+        with open(os.path.join(REPO, "hifigan", "my_config_v1_16000.json")) as f:
+            generator = em.VocoderExport(hifigan.Generator(hifigan.AttrDict(json.load(f)))).eval()  # random weights
+        torch.manual_seed(0)
+        mel = (torch.randn(1, 80, 260) - 5).numpy()
+        run = lambda m: generator(torch.from_numpy(np.ascontiguousarray(m))).numpy()
+        with torch.no_grad():
+            full, joined = run(mel)[0], em.stream_join(run, mel, self.PLAN, 320)
+        self.assertEqual(len(joined), len(full))
+        self.assertGreater(em.snr_db(full, joined), em.MIN_SNR_DB)
+
+
 class MelMap(unittest.TestCase):
     def test_the_committed_map_has_a_line_per_band(self):
         a, c = em.load_mel_map(em.MEL_MAP)
@@ -298,11 +332,15 @@ class BigVGANDecoder(unittest.TestCase):
         self.assertGreater(em.snr_db(self.ref, wav), em.MIN_SNR_DB)
 
     def test_onnx_export_matches_reference(self):
-        # export_decoder checks the file against reference_wav on each input, and raises if they disagree
+        # export_vocoder and export_voice check the files against PyTorch, and raise if they disagree
+        mel = em.MelExport(self.fs2, self.voc).eval()(self.units.repeat(1, 3, 1)).numpy()
+        vinfo, vchecks = em.export_vocoder(self.vocoder, "test", self.tmp.name, mel, lambda s: None, self.voc)
+        self.assertGreater(vchecks[1]["chunks"], 2)  # it streamed in several chunks
+        self.assertGreater(vinfo["bytes"], 400e6)
         units = [self.units.numpy(), self.units[:, :57].numpy()]
-        info, checks = em.export_decoder(self.fs2, self.vocoder, "test", self.tmp.name, units, lambda s: None, self.voc)
+        info, checks = em.export_voice(self.fs2, "test", self.tmp.name, units, lambda s: None, self.voc, None, self.vocoder,
+                                       os.path.join(self.tmp.name, "vocoder-test.onnx"))
         self.assertEqual(len(checks), 2)
-        self.assertGreater(info["bytes"], 400e6)
 
 
 @unittest.skipUnless(WITH_BIGVGAN, "set WESPER_BIGVGAN=1 to run BigVGAN (and have its checkpoint cached)")
@@ -330,12 +368,14 @@ class MappedEnglishBigVGAN(unittest.TestCase):
         self.assertEqual(len(ref), em.vocoders.n_frames(self.units.shape[1], self.voc) * self.voc.hop)
 
     def test_onnx_export_matches_reference(self):
-        # export_decoder checks the file against reference_wav on each input, and raises if they disagree
+        # export_vocoder and export_voice check the files against PyTorch (bigvgan_preview.py's path), and raise if they disagree
+        mel = em.MelExport(self.fs2, self.voc, self.mel_map).eval()(self.units.repeat(1, 3, 1)).numpy()
+        em.export_vocoder(self.vocoder, "test", self.tmp.name, mel, lambda s: None, self.voc)
         units = [self.units.numpy(), self.units[:, :57].numpy()]
-        info, checks = em.export_decoder(self.fs2, self.vocoder, "test", self.tmp.name, units, lambda s: None, self.voc,
-                                         self.mel_map)
+        info, checks = em.export_voice(self.fs2, "test", self.tmp.name, units, lambda s: None, self.voc, self.mel_map,
+                                       self.vocoder, os.path.join(self.tmp.name, "vocoder-test.onnx"))
         self.assertEqual(len(checks), 2)
-        self.assertGreater(info["bytes"], 400e6)
+        self.assertGreater(info["bytes"], 100e6)
 
 
 @unittest.skipUnless(os.environ.get("WESPER_EXPORT_SMOKE"), "set WESPER_EXPORT_SMOKE=1 to run the full export")
@@ -359,7 +399,7 @@ class ExportSmoke(unittest.TestCase):
 
             manifest = json.load(open(os.path.join(out, "models.json")))
             self.assertEqual([e["id"] for e in manifest["encoders"]], ["sv", "original"] if has_sv else ["original"])
-            self.assertEqual((manifest["version"], manifest["sampleRate"], manifest["hop"]), (2, 16000, 320))
+            self.assertEqual((manifest["version"], manifest["sampleRate"], manifest["hop"]), (3, 16000, 320))
             original = manifest["encoders"][-1]
             self.assertEqual((original["targetDbfs"], original["maxGainDb"]), (None, None))
             if has_sv:
@@ -367,16 +407,22 @@ class ExportSmoke(unittest.TestCase):
             expected = (["sv-narrator"] * has_sv_decoder + ["sv-narrator-bigvgan"] * bool(bigvgan_run) + ["googletts"]
                         + ["googletts-bigvgan"] * WITH_BIGVGAN)
             self.assertEqual([d["id"] for d in manifest["decoders"]], expected)
+            vocoders = {v["id"]: v for v in manifest["vocoders"]}
+            self.assertEqual(sorted(vocoders), sorted(["hifigan16k"] + ["bigvgan22k"] * bool(bigvgan_run or WITH_BIGVGAN)))
+            for v in manifest["vocoders"]:
+                self.assertEqual(v["file"]["path"], f"vocoder-{v['id']}.onnx")
+                self.assertGreater(v["checks"][1]["chunks"], 1)  # the stream check ran in several chunks
             for d in manifest["decoders"]:
                 self.assertEqual((d["vocoder"], d["sampleRate"], d["hop"]),
                                  ("bigvgan22k", 22050, 256) if d["id"].endswith("-bigvgan") else ("hifigan16k", 16000, 320))
+                self.assertEqual(d["file"]["path"], f"fs2-{d['id']}.onnx")
+                self.assertEqual(vocoders[d["vocoderId"]]["vocoder"], d["vocoder"])
                 self.assertEqual(d["language"], "en" if d["id"].startswith("googletts") else "sv")
                 self.assertEqual(d["melMap"], d["id"] == "googletts-bigvgan")
                 self.assertIsInstance(d["vocoderFineTuned"], bool)
             self.assertEqual(sorted(f for f in os.listdir(out) if f.endswith(".onnx")),
-                             sorted([f"encoder-{e['id']}.onnx" for e in manifest["encoders"]] +
-                                    [f"decoder-{d['id']}.onnx" for d in manifest["decoders"]]))
-            for entry in manifest["encoders"] + manifest["decoders"]:
+                             sorted(e["file"]["path"] for e in manifest["encoders"] + manifest["vocoders"] + manifest["decoders"]))
+            for entry in manifest["encoders"] + manifest["vocoders"] + manifest["decoders"]:
                 info = entry["file"]
                 path = os.path.join(out, info["path"])
                 self.assertEqual(os.path.getsize(path), info["bytes"])

@@ -89,6 +89,7 @@
               {out.gainDb === null ? "input as-is" : `input ${signed(out.gainDb)} to ${out.encoder.targetDbfs} dBFS`}
               · {((out.encodeMs + out.decodeMs) / 1000).toFixed(2)} s
               <span title="encoder + decoder">({(out.encodeMs / 1000).toFixed(2)} + {(out.decodeMs / 1000).toFixed(2)})</span>
+              {#if out.firstMs !== null}· streamed: first chunk after {(out.firstMs / 1000).toFixed(2)} s{/if}
             {/if}
           </span>
         </div>

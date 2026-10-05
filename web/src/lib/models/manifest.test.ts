@@ -4,10 +4,10 @@ import { defaultDecoder, defaultEncoder, fileUrl, languages, parseManifest, voic
 const file = (path: string) => ({ path, bytes: 100, sha256: "ab".repeat(32) });
 const entry = (id: string) => ({ id, label: id, description: "", file: file(`${id}.onnx`) });
 const manifest = (): Manifest => ({
-  version: 2, sampleRate: 16000, hop: 320, maxSeconds: 120,
+  version: 2, sampleRate: 16000, hop: 320, maxSeconds: 120, vocoders: [],
   encoders: [{ ...entry("sv"), targetDbfs: -20, maxGainDb: 40 }, { ...entry("original"), targetDbfs: null, maxGainDb: null }],
   decoders: [entry("sv-narrator"), entry("sv-narrator-bigvgan"), entry("googletts"), entry("googletts-bigvgan")].map((d) => ({
-    ...d, language: d.id.startsWith("googletts") ? "en" : "sv", vocoderFineTuned: d.id === "sv-narrator-bigvgan", melMap: d.id === "googletts-bigvgan",
+    ...d, language: d.id.startsWith("googletts") ? "en" : "sv", vocoderId: null, vocoderFineTuned: d.id === "sv-narrator-bigvgan", melMap: d.id === "googletts-bigvgan",
     ...(d.id.endsWith("bigvgan") ? { vocoder: "bigvgan22k", sampleRate: 22050, hop: 256 } : { vocoder: "hifigan16k", sampleRate: 16000, hop: 320 }),
   })),
 });
@@ -72,6 +72,51 @@ describe("parseManifest", () => {
   });
   test("says how to fix it", () => {
     expect(() => parseManifest({})).toThrow("web/export_models.py");
+  });
+});
+
+// Version 3: each voice is FastSpeech2 (decoders) plus a vocoder file (vocoders), as export_models.py writes it.
+const plan = (first: number, chunk: number, context: number) => ({ firstFrames: first, chunkFrames: chunk, contextFrames: context });
+const v3 = (): Manifest => {
+  const m = manifest();
+  m.version = 3;
+  m.vocoders = [
+    { ...entry("hifigan16k"), vocoder: "hifigan16k", sampleRate: 16000, hop: 320, stream: plan(25, 100, 20) },
+    { ...entry("bigvgan22k"), vocoder: "bigvgan22k", sampleRate: 22050, hop: 256, stream: plan(44, 173, 35) },
+    { ...entry("sv-narrator-bigvgan"), vocoder: "bigvgan22k", sampleRate: 22050, hop: 256, stream: plan(44, 173, 35) },
+  ];
+  for (const d of m.decoders) d.vocoderId = d.id === "sv-narrator-bigvgan" ? d.id : d.vocoder;
+  return m;
+};
+
+describe("version 3", () => {
+  test("gives each voice its vocoder file and how to stream it", () => {
+    const m = parseManifest(v3());
+    expect(m.decoders.map((d) => d.vocoderId)).toEqual(["hifigan16k", "sv-narrator-bigvgan", "hifigan16k", "bigvgan22k"]);
+    expect(m.vocoders[0].stream).toEqual(plan(25, 100, 20));
+  });
+  test("version 2 voices have no vocoder file of their own", () => {
+    const m = parseManifest(manifest());
+    expect(m.vocoders).toEqual([]);
+    expect(m.decoders.every((d) => d.vocoderId === null)).toBe(true);
+  });
+  test("rejects a voice without its vocoder", () => {
+    const m = v3();
+    m.vocoders = m.vocoders.filter((v) => v.id !== "bigvgan22k");
+    expect(() => parseManifest(m)).toThrow("googletts-bigvgan's vocoder bigvgan22k isn't in vocoders");
+  });
+  test("rejects a voice that doesn't match its vocoder", () => {
+    const m = v3();
+    m.decoders[0].vocoderId = "bigvgan22k";
+    expect(() => parseManifest(m)).toThrow("sv-narrator doesn't match its vocoder bigvgan22k");
+  });
+  test("rejects a vocoder without a stream plan", () => {
+    const m = v3();
+    (m.vocoders[0] as Partial<(typeof m.vocoders)[0]>).stream = undefined;
+    expect(() => parseManifest(m)).toThrow("hifigan16k has no stream plan");
+  });
+  test("needs vocoders", () => {
+    expect(() => parseManifest({ ...v3(), vocoders: [] })).toThrow("no vocoders");
   });
 });
 
